@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "../shared/vault-types.h"
 #include "userconfig.h"
@@ -30,8 +31,10 @@
 // 3rd: WDIR Can edit directories and create subdirectories
 // 4th: CVKEY Can create new Vault key with the same permissions
 
-gpgme_error_t get_vault_passphrase(void* hook, const char* uid_hint, const char* passphrase_info, int prev_was_bad, int fd);
 
+int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size);
+gpgme_error_t encrypt_vault(userconfig_t* uconfig, gpgme_ctx_t context, gpgme_data_t* content);
+gpgme_error_t get_vault_passphrase(void* hook, const char* uid_hint, const char* passphrase_info, int prev_was_bad, int fd);
 static const char VKEY_ALPHABET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIKLMNOPQRSTUVWXYZ0123456789!#$%&'()*+-./:;<=>?@[\\]^_{|}~"; 
 
 #define iferr_throw(err) if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return -1;}
@@ -57,7 +60,7 @@ int create_vkey(vaultkey_t *key, vflag_t perms) {
     return 0;
 }
 
-int iterate_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle_key_cb) {  
+int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle_key_cb) {  
     //First check if vaultpath and passphrase are valid strings, then check if vaultpath is a valid path to a file
     if(uconfig->vaultpath == NULL || passphrase == NULL) {
         return -1;
@@ -79,7 +82,9 @@ int iterate_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handl
     //Create context 
     err = gpgme_new(&context);
     iferr_throw(err)
-    
+    // turn on ascii armor
+    gpgme_set_armor(context, 1);
+
     //setup the correct passphrase callback
     //Expand passphrase to 32 characters
     char passwd[32];
@@ -90,27 +95,41 @@ int iterate_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handl
     gpgme_data_new_from_stream(&input, fp);
     gpgme_op_decrypt(context, input, output);
     
+    vaultkey_t* wkeys = calloc(10, sizeof(vaultkey_t));
+    size_t vaultsize = 10;
+    int lineidx = 0;
+    int keyidx = 0;
+    bool exit = false;
+    
     //Now we can read the contents of the file
-    for (int i = 0; i < uconfig->max_vkeys; i++) {
-        // prepare key and permissions for handling operations 
+    while (!exit) {
+        if(keyidx >= vaultsize) {
+            vaultsize *= 2;
+            wkeys = reallocarray(wkeys, vaultsize, sizeof(vaultkey_t));
+        }
+        
         vaultkey_t* vkey = malloc(sizeof(vaultkey_t));
-        gpgme_data_read(output, vkey->key, 256);
+        // prepare key and permissions for handling operations 
+        ssize_t read = gpgme_data_read(output, vkey->key, 256);
+        
         //check if key is valid (is contained in alphabet) -> to prevent possible attacks from modifying the vaultkeyfile
-        if(!str_in_alphabet(vkey->key, VKEY_LEN, VKEY_ALPHABET, sizeof(VKEY_ALPHABET))) {
-            printf("Line %d in vault file is faulty", i);
-            continue;
+        if(read < 0 || !str_in_alphabet(vkey->key, VKEY_LEN, VKEY_ALPHABET, sizeof(VKEY_ALPHABET))) {
+            printf("Line %d in vault file is faulty or can't read line", lineidx);
+            break;
         }
         
         char permsbuffer[10];
-        gpgme_data_read(output, permsbuffer, 10);
+        read = gpgme_data_read(output, permsbuffer, 10);
         //,00000000\n is the normal format (or \n replaced with EOF)
-        if(permsbuffer[0] != ',' || permsbuffer[9] != '\n') {
-            printf("Line %d in vault file is faulty", i);
+        if(read < 0 || permsbuffer[0] != ',' || permsbuffer[9] != '\n') {
+            printf("Line %d in vault file is faulty or can't read", lineidx);
+            break;
         }
         
         //check if perms is valid and parse
         if(!str_in_alphabet(permsbuffer+1, sizeof(vflag_t)*8, "01", 2)) {
-            printf("Line %d in vault file is faulty", i);
+            printf("Line %d in vault file is faulty", lineidx);
+            break;
         }
 
         vkey->perms = parse_vflag(permsbuffer+1);
@@ -118,20 +137,33 @@ int iterate_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handl
         enum vaultkey_action action = handle_key_cb(vkey);
         switch (action) {
             case FINISH_ITER:
-                return -1;
-            case DELETE_KEY:
-                break;
-            case DELETE_AND_FIN:
+                wkeys[keyidx++] = *vkey;
+                exit = true;
+                vaultsize = keyidx;
                 break;
             case NOTHING:
+                //only case where we have to add the key to the vault again
+                wkeys[keyidx++] = *vkey;
+                break; 
+            case DELETE_AND_FIN:
+                exit = true;
+                vaultsize = keyidx;
                 break;
-            
+            case DELETE_KEY: 
+                // to fore clang not to bother me about handling all cases
+                break;
         }
+        lineidx++;
+        free(vkey);
     }
-    
+    gpgme_data_t new_vault;
+    gpgme_data_new(&new_vault);
+    write_vault(&new_vault, wkeys, vaultsize);
+    encrypt_vault(uconfig, context, &new_vault);
+    return vaultsize; 
 }
 
-int write_vault(gpgme_data_t *output, char* passphrase, vaultkey_t* key, size_t size) {
+int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size) {
     for(size_t i = 0; i < size; i++) {
         //convert perms to string
         char perm_str[8];
@@ -151,6 +183,18 @@ int write_vault(gpgme_data_t *output, char* passphrase, vaultkey_t* key, size_t 
         gpgme_data_write(*output, line, written);
     }
     return size;
+}
+
+gpgme_error_t encrypt_vault(userconfig_t* uconfig, gpgme_ctx_t context, gpgme_data_t* content) {
+    // Do a symmetric encryption with passphrase
+    //setup output data
+    gpgme_data_t cryptdata;
+    gpgme_error_t err = gpgme_data_set_file_name(cryptdata, uconfig->vaultpath);
+    if(err) { 
+        return err; 
+    }
+    //because the passphrase call back is still set we provide the passphrase via the callback
+    return gpgme_op_encrypt(context, NULL, GPGME_ENCRYPT_SYMMETRIC, *content, cryptdata);
 }
 
 gpgme_error_t get_vault_passphrase(void* hook, const char* uid_hint, const char* passphrase_info, int prev_was_bad, int fd) {
