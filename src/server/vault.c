@@ -37,8 +37,8 @@ gpgme_error_t encrypt_vault(userconfig_t* uconfig, gpgme_ctx_t context, gpgme_da
 gpgme_error_t get_vault_passphrase(void* hook, const char* uid_hint, const char* passphrase_info, int prev_was_bad, int fd);
 static const char VKEY_ALPHABET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIKLMNOPQRSTUVWXYZ0123456789!#$%&'()*+-./:;<=>?@[\\]^_{|}~"; 
 
-#define iferr_throw(err) if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return -1;}
-
+#define iferr_throw(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return NULL;} } while(0)
+#define iferr_throw_code(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return -1;} } while(0)
 
 //TODO add documentation and fix your doxygen plugin
 int create_vkey(vaultkey_t *key, vflag_t perms) {
@@ -60,16 +60,83 @@ int create_vkey(vaultkey_t *key, vflag_t perms) {
     return 0;
 }
 
-int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle_key_cb) {  
+int vkey_remove(userconfig_t* uconfig, char* passphrase, char* key) {
+   //TODO add remove operation 
+}
+
+vaultkey_t* vkey_is_valid(userconfig_t* uconfig, char* passphrase, char* key) {
+    size_t vsize;
+    vaultkey_t* vaultkeys = read_vault(uconfig, passphrase, &vsize);
+    if(vaultkeys == NULL) {
+        return NULL;
+    }
+
+    for(size_t i = 0; i < vsize; i++) {
+        if(strcmp(vaultkeys[i].key, key) == 0) {
+            free(vaultkeys);
+            return vaultkeys+i;
+        }
+    }
+    free(vaultkeys);
+    return NULL;
+}
+
+gpgme_error_t add_key(userconfig_t* uconfig, char* passphrase, vflag_t perms) {
+    //Build array of already existing vaultkeys to avoid duplicates
+    vaultkey_t* gkey = malloc(sizeof(vaultkey_t));
+
+    size_t size = 0;
+    vaultkey_t* vaultkeys = read_vault(uconfig, passphrase, &size);
+    bool duplicatefound = false;
+    do {
+        int code = create_vkey(gkey, perms);
+        if(code < 0) {
+            return -1;
+        }
+
+        for(size_t i = 0; i < size; i++) {
+            if(strcmp(gkey->key, vaultkeys[i].key) == 0) {
+                duplicatefound = true;
+            }
+        }
+    } while(duplicatefound);
+
+    // if key is not a duplicate anymore -> add to array 
+    vaultkeys = reallocarray(vaultkeys, ++size, sizeof(vaultkey_t));
+    gpgme_ctx_t context;
+    gpgme_error_t err;
+    gpgme_data_t new_vault;
+    err = gpgme_data_new(&new_vault);
+    iferr_throw_code(err);
+
+    int nwrite = write_vault(&new_vault, vaultkeys, size);
+    if (nwrite < 0) {
+        return -1;
+    } 
+    //setup the correct passphrase callback
+    //Expand passphrase to 32 characters
+    char passwd[32];
+    snprintf(passwd, VDECRYPTKEY_LEN, "%32s", passphrase);
+    gpgme_set_passphrase_cb(context, &get_vault_passphrase, passwd);    
+
+    err = encrypt_vault(uconfig, context, &new_vault);
+    //Free structures 
+    gpgme_release(context);
+    gpgme_data_release(new_vault);
+    free(vaultkeys);
+    return err;
+}
+
+vaultkey_t* read_vault(userconfig_t* uconfig, char* passphrase, size_t* vaultsize) {  
     //First check if vaultpath and passphrase are valid strings, then check if vaultpath is a valid path to a file
     if(uconfig->vaultpath == NULL || passphrase == NULL) {
-        return -1;
+        return NULL;
     }
 
     // try to open vault in readonly
     FILE *fp = fopen(uconfig->vaultpath, "r");
     if(fp == NULL) {
-        return -1;
+        return NULL;
     }
     
     //Now use GPGme to decrypt the file and load its decrypted content into memory 
@@ -81,7 +148,7 @@ int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle
     
     //Create context 
     err = gpgme_new(&context);
-    iferr_throw(err)
+    iferr_throw(err);
     // turn on ascii armor
     gpgme_set_armor(context, 1);
 
@@ -92,20 +159,22 @@ int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle
     gpgme_set_passphrase_cb(context, &get_vault_passphrase, passwd);
     
     // Create input cipher and store decrypted output in plain output data
-    gpgme_data_new_from_stream(&input, fp);
+    err = gpgme_data_new_from_stream(&input, fp);
+    iferr_throw(err);
     gpgme_op_decrypt(context, input, output);
-    
+    iferr_throw(err);
+
     vaultkey_t* wkeys = calloc(10, sizeof(vaultkey_t));
-    size_t vaultsize = 10;
+    *vaultsize = 10;
     int lineidx = 0;
     int keyidx = 0;
-    bool exit = false;
+    bool done = false;
     
     //Now we can read the contents of the file
-    while (!exit) {
-        if(keyidx >= vaultsize) {
-            vaultsize *= 2;
-            wkeys = reallocarray(wkeys, vaultsize, sizeof(vaultkey_t));
+    while (!done) {
+        if(keyidx >= *vaultsize) {
+            *vaultsize *= 2;
+            wkeys = reallocarray(wkeys, *vaultsize, sizeof(vaultkey_t));
         }
         
         vaultkey_t* vkey = malloc(sizeof(vaultkey_t));
@@ -115,7 +184,7 @@ int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle
         //check if key is valid (is contained in alphabet) -> to prevent possible attacks from modifying the vaultkeyfile
         if(read < 0 || !str_in_alphabet(vkey->key, VKEY_LEN, VKEY_ALPHABET, sizeof(VKEY_ALPHABET))) {
             printf("Line %d in vault file is faulty or can't read line", lineidx);
-            break;
+            return NULL;
         }
         
         char permsbuffer[10];
@@ -123,44 +192,39 @@ int access_vault(userconfig_t* uconfig, char* passphrase, handle_key_cb_t handle
         //,00000000\n is the normal format (or \n replaced with EOF)
         if(read < 0 || permsbuffer[0] != ',' || permsbuffer[9] != '\n') {
             printf("Line %d in vault file is faulty or can't read", lineidx);
-            break;
+            return NULL;
+        }
+
+        if(permsbuffer[9] == EOF) {
+            *vaultsize = keyidx;
+            done = true;
         }
         
         //check if perms is valid and parse
         if(!str_in_alphabet(permsbuffer+1, sizeof(vflag_t)*8, "01", 2)) {
             printf("Line %d in vault file is faulty", lineidx);
-            break;
+            return NULL;
         }
 
         vkey->perms = parse_vflag(permsbuffer+1);
-        // dependent on return value from callback do different things
-        enum vaultkey_action action = handle_key_cb(vkey);
-        switch (action) {
-            case FINISH_ITER:
-                wkeys[keyidx++] = *vkey;
-                exit = true;
-                vaultsize = keyidx;
-                break;
-            case NOTHING:
-                //only case where we have to add the key to the vault again
-                wkeys[keyidx++] = *vkey;
-                break; 
-            case DELETE_AND_FIN:
-                exit = true;
-                vaultsize = keyidx;
-                break;
-            case DELETE_KEY: 
-                // to fore clang not to bother me about handling all cases
-                break;
-        }
+        wkeys[keyidx++] = *vkey;
+        
         lineidx++;
         free(vkey);
     }
     gpgme_data_t new_vault;
-    gpgme_data_new(&new_vault);
-    write_vault(&new_vault, wkeys, vaultsize);
+    err = gpgme_data_new(&new_vault);
+    iferr_throw(err);
+
+    write_vault(&new_vault, wkeys, *vaultsize);
     encrypt_vault(uconfig, context, &new_vault);
-    return vaultsize; 
+
+    //free all gpgme and other structures
+    gpgme_release(context);
+    gpgme_data_release(input);
+    gpgme_data_release(output);
+    gpgme_data_release(new_vault);
+    return wkeys; 
 }
 
 int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size) {
@@ -180,7 +244,10 @@ int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size) {
             snprintf(line, 265, "%256s,%8s", key->key, perm_str);
         }
         // write the line to output data
-        gpgme_data_write(*output, line, written);
+        ssize_t nwrite = gpgme_data_write(*output, line, written);
+        if(nwrite < 0) {
+            return -1;
+        }
     }
     return size;
 }
