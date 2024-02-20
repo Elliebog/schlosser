@@ -61,7 +61,47 @@ int create_vkey(vaultkey_t *key, vflag_t perms) {
 }
 
 int vkey_remove(userconfig_t* uconfig, char* passphrase, char* key) {
-   //TODO add remove operation 
+    size_t vsize;
+    vaultkey_t* vaultkeys = read_vault(uconfig, passphrase, &vsize);
+    if(vaultkeys == NULL) {
+        return NULL;
+    }
+
+    //find vaultkey at index and move all other vaultkeys one position up
+    bool found = false;
+    for(size_t i = 0; i < vsize; i++) {
+        if(!found || strcmp(vaultkeys[i].key, key) == 0) {
+            found = true;
+        }
+        if(found && i != vsize - 1) {
+            vaultkeys[i] = vaultkeys[i+1];
+        }
+    }
+
+    if(!found) {
+        return 0;
+    }
+    vsize--;
+
+    gpgme_ctx_t context;
+    gpgme_error_t err;
+    gpgme_data_t new_vault;
+    
+    err = gpgme_new(&context);
+    iferr_throw_code(err);
+
+    gpgme_data_new(&new_vault);
+    int nwrite = write_vault(&new_vault, vaultkeys, vsize);
+    if(nwrite < 0) {
+        return -1;
+    }
+    err = encrypt_vault(uconfig, context, &new_vault);
+    iferr_throw_code(err);
+
+    gpgme_data_release(new_vault);
+    gpgme_release(context);
+    free(vaultkeys);
+    return 1; 
 }
 
 vaultkey_t* vkey_is_valid(userconfig_t* uconfig, char* passphrase, char* key) {
