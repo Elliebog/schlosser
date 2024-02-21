@@ -4,6 +4,9 @@
 #include "vault-types.h"
 
 int str_in_alphabet(char* str, size_t len, const char* alphabet, size_t alphabetsize) {
+    if(str == NULL || alphabet == NULL) {
+        return -1;
+    }
     //Build a map with size 255 -> set element at index = char-value to 1 if it is in the alphabet 
     //and afterwards iterate through string and check that element is always 1
     unsigned char map[256];

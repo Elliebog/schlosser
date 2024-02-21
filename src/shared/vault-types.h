@@ -19,12 +19,12 @@
 // 4th: CVKEY Can create new Vault key with the same permissions
 
 typedef unsigned char vflag_t;
-//              01234567
-#define RPWD    00000001
-#define CPWD    00000010
-#define WPWD    00000111
-#define WDIR    00001000
-#define CVKEY   00010000
+//              0b01234567
+#define RPWD    0b00000001
+#define CPWD    0b00000010
+#define WPWD    0b00000100
+#define WDIR    0b00001000
+#define CVKEY   0b00010000
 
 int vflag_setattr(vflag_t *flag, unsigned char mask, unsigned char val);
 vflag_t vflag_getattr(vflag_t flag, unsigned char mask);
