@@ -40,6 +40,11 @@ void test_parse_vflag() {
     vflag_t flag = 0b00011010;
     char* flag_str = "00011010";
     TEST_ASSERT_EQUAL_UINT8(flag, parse_vflag(flag_str));
+    char* err_flag_str = "abc00110";
+    TEST_ASSERT_EQUAL_UINT8(0, parse_vflag(err_flag_str));
+
+    char* wrong_flag_str = "00011000";
+    TEST_ASSERT_NOT_EQUAL_UINT8(flag, parse_vflag(wrong_flag_str));
 } 
 
 void test_vflag_tostring() {
