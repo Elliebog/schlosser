@@ -40,7 +40,13 @@ static const char VKEY_ALPHABET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIKLMNOPQR
 #define iferr_throw(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return NULL;} } while(0)
 #define iferr_throw_code(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return -1;} } while(0)
 
-//TODO add documentation and fix your doxygen plugin
+/**
+ * @brief Create a new 256-char length vaultkey with VKEY_ALPHABET  
+ *
+ * @param vaultkey_t* key Where to put the key 
+ * @param vflag_t perms The permissions of the new key
+ * @return -1 if there was an error from reading /dev/urandom else 0
+ */
 int create_vkey(vaultkey_t *key, vflag_t perms) {
     // use random bytes from /dev/urandom and convert them to random floats from 0 to 1
     unsigned char buffer[VKEY_LEN];
@@ -60,11 +66,19 @@ int create_vkey(vaultkey_t *key, vflag_t perms) {
     return 0;
 }
 
+/**
+ * @brief Remove a key from the vault
+ *
+ * @param userconfig_t* uconfig corresponding config
+ * @param char* passphrase The passphrase for the vault encryption
+ * @param char* key the key to remove
+ * @return -1 if there was an error in the read/write operation or a wrong passphrase was provided. 0 if the key was not found. 1 if the key was removed successfully
+ */
 int vkey_remove(userconfig_t* uconfig, char* passphrase, char* key) {
     size_t vsize;
     vaultkey_t* vaultkeys = read_vault(uconfig, passphrase, &vsize);
     if(vaultkeys == NULL) {
-        return NULL;
+        return -1;
     }
 
     //find vaultkey at index and move all other vaultkeys one position up
@@ -104,6 +118,14 @@ int vkey_remove(userconfig_t* uconfig, char* passphrase, char* key) {
     return 1; 
 }
 
+/**
+ * @brief Checks if the vaultkey is authorized to unlock
+ *
+ * @param userconfig_t* uconfig that contains vault information
+ * @param char* passphrase Passphrase to unlock vault. 0-terminated string
+ * @param char* key to authorize user passwords
+ * @return NULL if the key is NULL or if the key doesn't exist in the vault
+ */
 vaultkey_t* vkey_is_valid(userconfig_t* uconfig, char* passphrase, char* key) {
     size_t vsize;
     vaultkey_t* vaultkeys = read_vault(uconfig, passphrase, &vsize);
@@ -121,6 +143,14 @@ vaultkey_t* vkey_is_valid(userconfig_t* uconfig, char* passphrase, char* key) {
     return NULL;
 }
 
+/**
+ * @brief Add a key to the vault
+ *
+ * @param userconfig_t* uconfig config that points to vault
+ * @param char* passphrase passphrase to unlock vault encryption
+ * @param vflag_t perms what the vault key is allowed to do
+ * @return Error if one occured else NULL
+ */
 gpgme_error_t add_key(userconfig_t* uconfig, char* passphrase, vflag_t perms) {
     //Build array of already existing vaultkeys to avoid duplicates
     vaultkey_t* gkey = malloc(sizeof(vaultkey_t));
@@ -160,13 +190,21 @@ gpgme_error_t add_key(userconfig_t* uconfig, char* passphrase, vflag_t perms) {
     gpgme_set_passphrase_cb(context, &get_vault_passphrase, passwd);    
 
     err = encrypt_vault(uconfig, context, &new_vault);
-    //Free structures 
+    //Free structures
     gpgme_release(context);
     gpgme_data_release(new_vault);
     free(vaultkeys);
     return err;
 }
 
+/**
+ * @brief Read the contents of the vault
+ *
+ * @param userconfig_t* uconfig config for the user pointing to the vault
+ * @param char* passphrase passphrase to unlock the vault
+ * @param size_t* vaultsize variable that gets set to the number of keys found
+ * @return NULL if an error was encountered, else vaultkey pointer
+ */
 vaultkey_t* read_vault(userconfig_t* uconfig, char* passphrase, size_t* vaultsize) {  
     //First check if vaultpath and passphrase are valid strings, then check if vaultpath is a valid path to a file
     if(uconfig->vaultpath == NULL || passphrase == NULL) {
@@ -252,21 +290,21 @@ vaultkey_t* read_vault(userconfig_t* uconfig, char* passphrase, size_t* vaultsiz
         lineidx++;
         free(vkey);
     }
-    gpgme_data_t new_vault;
-    err = gpgme_data_new(&new_vault);
-    iferr_throw(err);
-
-    write_vault(&new_vault, wkeys, *vaultsize);
-    encrypt_vault(uconfig, context, &new_vault);
-
     //free all gpgme and other structures
     gpgme_release(context);
     gpgme_data_release(input);
     gpgme_data_release(output);
-    gpgme_data_release(new_vault);
     return wkeys; 
 }
 
+/**
+ * @brief writes the content of the vault
+ *
+ * @param gpgme_data_t* output gpgme_data handler to write to
+ * @param vaultkey_t* key array pointer to vaultkeys array
+ * @param size_t size size of the array
+ * @return [TODO:description
+ */
 int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size) {
     for(size_t i = 0; i < size; i++) {
         //convert perms to string
@@ -292,6 +330,14 @@ int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size) {
     return size;
 }
 
+/**
+ * @brief Encrypt vault data and write to file. Requires for the passphrase cb to be already set with gpgme_set_passphrase_cb
+ *
+ * @param userconfig_t* uconfig Config for the vault
+ * @param gpgme_ctx_t context 
+ * @param gpgme_data_t* content data to be encrypted
+ * @return gpgme_error_t if encountered
+ */
 gpgme_error_t encrypt_vault(userconfig_t* uconfig, gpgme_ctx_t context, gpgme_data_t* content) {
     // Do a symmetric encryption with passphrase
     //setup output data

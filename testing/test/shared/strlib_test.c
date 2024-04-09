@@ -57,6 +57,7 @@ void test_vflag_tostring() {
 
 int main() {
     UNITY_BEGIN();
-
+    RUN_TEST(test_str_in_alphabet);
+    RUN_TEST(test_parse_vflag);
     return UNITY_END();
 }
