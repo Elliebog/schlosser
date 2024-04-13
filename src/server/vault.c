@@ -7,10 +7,10 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "../shared/vault-types.h"
-#include "userconfig.h"
-#include "vault.h"
-#include "../shared/strlib.h"
+#include "src/shared/vault-types.h"
+#include "src/server/userconfig.h"
+#include "src/server/vault.h"
+#include "src/shared/strlib.h"
 
 // Each userspace has one vault (vaults and userspace should be different directories. Adjustable in config)
 // Vault file syntax
@@ -35,7 +35,7 @@
 int write_vault(gpgme_data_t *output, vaultkey_t* key, size_t size);
 gpgme_error_t encrypt_vault(userconfig_t* uconfig, gpgme_ctx_t context, gpgme_data_t* content);
 gpgme_error_t get_vault_passphrase(void* hook, const char* uid_hint, const char* passphrase_info, int prev_was_bad, int fd);
-static const char VKEY_ALPHABET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIKLMNOPQRSTUVWXYZ0123456789!#$%&'()*+-./:;<=>?@[\\]^_{|}~"; 
+static const char VKEY_ALPHABET[] = VKEY_ALPH_STRING; 
 
 #define iferr_throw(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return NULL;} } while(0)
 #define iferr_throw_code(err) do { if(err) { printf("GPGme failed with error code %s from source: %s", gpgme_strerror(err), gpgme_strsource(err)); return -1;} } while(0)

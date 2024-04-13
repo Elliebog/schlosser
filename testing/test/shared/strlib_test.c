@@ -1,5 +1,5 @@
-#include "../../unity/unity.h"
-#include "../../../src/shared/strlib.h"
+#include "testing/unity/unity.h"
+#include "src/shared/strlib.h"
 #include <string.h>
 
 void setUp() {

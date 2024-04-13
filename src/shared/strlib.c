@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
-#include "strlib.h"
-#include "vault-types.h"
+#include "src/shared/strlib.h"
+#include "src/shared/vault-types.h"
 
 /**
  * @brief Checks if the elements of the string are contained in an alphabet (=string)

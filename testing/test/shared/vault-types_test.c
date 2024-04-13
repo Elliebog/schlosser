@@ -1,5 +1,5 @@
-#include "../../unity/unity.h"
-#include "../../../src/shared/vault-types.h"
+#include "testing/unity/unity.h"
+#include "src/shared/vault-types.h"
 
 void setUp() {
 

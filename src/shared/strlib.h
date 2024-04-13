@@ -1,5 +1,5 @@
 #pragma once
-#include "vault-types.h"
+#include "src/shared/vault-types.h"
 #include <string.h>
 
 int str_in_alphabet(char* str, size_t len, const char* alphabet, size_t alphabetsize); 
