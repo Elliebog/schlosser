@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "codelldb",
+            "request": "launch",
+            "name": "Debug",
+            "program": "${workspaceFolder}/target/debug/schlosser",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": [ "rust" ]
+        }
+    ]
+}
+
