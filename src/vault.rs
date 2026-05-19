@@ -1,21 +1,27 @@
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, stdin},
     path::Path,
     string::FromUtf8Error,
 };
-const VAULT_SIGNATURE: u32 = 0x0000e111e0afbaca;
-const VAULT_SIGNATURE_LENGTH: usize = 4;
+use crate::hmac;
+use crate::crypt::IV_LENGTH;
+use crate::crypt::generate_user_key;
+const VAULT_SIGNATURE: u64 = 0x0000e111e0afbaca;
+const VAULT_SIGNATURE_LENGTH: usize = 8;
 const VAULT_VERSION: u8 = 1;
 const VAULT_VERSION_LENGTH: usize = 1;
 const VAULTNAME_LENGTH: usize = 128;
-const VAULTKEY_LENGTH: usize = 256;
+const VAULTKEY_LENGTH: usize = 32;
 const VAULTENTRY_LENGTH: usize = 145;
 const VAULTENTRYNAME_LENGTH: usize = 128;
 const VAULTENTRYTYPE_LENGTH: usize = 1;
 const DIRENTRY_SIZE_LENGTH: usize = 8;
 const BLOCKID_LENGTH: usize = 8;
 const SECRET_SIZE_LENGTH: usize = 8;
+const VAULTTABLE_INFO_LENGTH: usize = 64;
+const ENCRYPTED_REGION_LENGTH: usize = VAULTKEY_LENGTH+VAULTTABLE_INFO_LENGTH; 
+
 /// Contextual Information about a schlosser vault also called a schlosser archive
 struct VaultContext {
     /// Version of the archive structure
@@ -56,6 +62,7 @@ enum ReadVaultFileError {
     ReadError(ReadFieldError, u64),
     ReadEntryError(ReadFieldError, u64),
     InvalidFile(String),
+    ReadStdinError(std::io::Error),
 }
 
 enum ReadFieldError {
@@ -73,38 +80,58 @@ impl VaultContext {
         };
         let mut reader = BufReader::new(file);
         let offset: u64 = 0;
-
-        // Check if this file is meant to be a vault archive file
-        let signature = u32::from_ne_bytes(
-            read_field::<VAULT_SIGNATURE_LENGTH>(&mut reader)
-                .map_err(|e| ReadVaultFileError::ReadError(e, offset))?,
-        );
-        offset += VAULT_SIGNATURE_LENGTH as u64;
-
-        if signature != VAULT_SIGNATURE {
-            return Err(ReadVaultFileError::InvalidFile(String::from(
-                "This file is not a vault file",
-            )));
-        }
-
-        //Add a version field for future changes to the vault archive structure
-        let version =
-            read_field(&mut reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?[0];
-        offset += VAULT_VERSION_LENGTH as u64;
-        if version != VAULT_VERSION {
-            return Err(ReadVaultFileError::InvalidFile(String::from(
-                "This file specifies a version not supported by schlosser",
-            )));
-        }
-
-        let (bytes_read, name) =
-            read_string_field(&mut reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-        offset += bytes_read as u64;
-
-        let vault_key = read_field::<VAULTKEY_LENGTH>(&mut reader)
-            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-        offset += VAULTKEY_LENGTH as u64;
     }
+}
+
+fn read_header(reader: &mut BufReader<File>) -> Result<VaultContext, ReadVaultFileError> {
+    let mut offset: u64 = 0;
+    // Check if this file is meant to be a vault archive file
+    let signature = u64::from_ne_bytes(
+        read_field::<VAULT_SIGNATURE_LENGTH>(reader)
+            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?,
+    );
+    offset += VAULT_SIGNATURE_LENGTH as u64;
+
+    if signature != VAULT_SIGNATURE {
+        return Err(ReadVaultFileError::InvalidFile(String::from(
+            "This file is not a vault file",
+        )));
+    }
+
+    //Add a version field for future changes to the vault archive structure
+    let version = read_field(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?[0];
+    offset += VAULT_VERSION_LENGTH as u64;
+    if version != VAULT_VERSION {
+        return Err(ReadVaultFileError::InvalidFile(String::from(
+            "This file specifies a version not supported by schlosser",
+        )));
+    }
+
+    let (bytes_read, name) =
+        read_string_field(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    offset += bytes_read as u64;
+    
+    let userkey_iv = read_field::<IV_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    offset += IV_LENGTH as u64;
+
+    //Generate user key based on information gathered
+    let user_key = get_user_key(&userkey_iv).map_err(|e| ReadVaultFileError::ReadStdinError(e))?;
+
+
+    let keyregion = read_field::<ENCRYPTED_REGION_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    offset += ENCRYPTED_REGION_LENGTH as u64;     
+
+    //Verify that the keyregion has not been tampered with
+    let mac = read_field::<{hmac::HMAC_SIZE}>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    hmac::verify_hmac_code(&mac, &keyregion, secret_key) 
+    
+}
+
+fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::Error> {
+    let mut pwd: String = String::new();
+    stdin().read_line(&mut pwd)?;
+
+    Ok(generate_user_key(pwd, iv))
 }
 
 fn read_table(reader: &mut BufReader<File>) -> Result<Vec<VaultEntry>, ReadVaultFileError> {
@@ -176,8 +203,11 @@ fn read_entry(reader: &mut BufReader<File>) -> Result<VaultEntry, ReadFieldError
                 directory_name: name,
                 children: Vec::new(),
             };
-            let size = u64::from_ne_bytes(entry[offset..offset + DIRENTRY_SIZE_LENGTH].try_into().unwrap());
-            
+            let size = u64::from_ne_bytes(
+                entry[offset..offset + DIRENTRY_SIZE_LENGTH]
+                    .try_into()
+                    .unwrap(),
+            );
         }
         1 => {}
         2 => {}
