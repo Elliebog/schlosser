@@ -1,12 +1,12 @@
+use crate::crypt::{
+    AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, encrypt_region, generate_user_key,
+};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read, stdin},
     path::Path,
     string::FromUtf8Error,
 };
-use crate::hmac;
-use crate::crypt::IV_LENGTH;
-use crate::crypt::generate_user_key;
 const VAULT_SIGNATURE: u64 = 0x0000e111e0afbaca;
 const VAULT_SIGNATURE_LENGTH: usize = 8;
 const VAULT_VERSION: u8 = 1;
@@ -19,10 +19,11 @@ const VAULTENTRYTYPE_LENGTH: usize = 1;
 const DIRENTRY_SIZE_LENGTH: usize = 8;
 const BLOCKID_LENGTH: usize = 8;
 const SECRET_SIZE_LENGTH: usize = 8;
-const VAULTTABLE_INFO_LENGTH: usize = 64;
-const ENCRYPTED_REGION_LENGTH: usize = VAULTKEY_LENGTH+VAULTTABLE_INFO_LENGTH; 
+const VAULTTABLE_INFO_LENGTH: usize = 64; //512 bit
+const ENCRYPTED_REGION_LENGTH: usize = VAULTKEY_LENGTH + VAULTTABLE_INFO_LENGTH; //Key + VTIE Length
 
 /// Contextual Information about a schlosser vault also called a schlosser archive
+#[derive(Debug)]
 struct VaultContext {
     /// Version of the archive structure
     version: u8,
@@ -34,8 +35,22 @@ struct VaultContext {
     root_entry: VaultEntry,
 }
 
+#[derive(Debug)]
+struct HeaderInfo {
+    /// Version specified in the header
+    version: u8,
+    /// Name of the vault archive
+    name: String,
+    /// Key Region nonce
+    key_region_nonce: [u8; AES_NONCE_LENGTH],
+    // Decrypted vault key
+    vault_key: [u8; VAULTKEY_LENGTH],
+    vault_table_size: u64,
+}
+
 /// A vault entry found in the vault entry table
 /// Each entry is 128+8+8 bytes long
+#[derive(Debug)]
 enum VaultEntry {
     PasswordEntry {
         /// Name of the password
@@ -63,6 +78,8 @@ enum ReadVaultFileError {
     ReadEntryError(ReadFieldError, u64),
     InvalidFile(String),
     ReadStdinError(std::io::Error),
+    CryptographyError(String),
+    CorruptedFileError(String),
 }
 
 enum ReadFieldError {
@@ -83,7 +100,7 @@ impl VaultContext {
     }
 }
 
-fn read_header(reader: &mut BufReader<File>) -> Result<VaultContext, ReadVaultFileError> {
+fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFileError> {
     let mut offset: u64 = 0;
     // Check if this file is meant to be a vault archive file
     let signature = u64::from_ne_bytes(
@@ -107,24 +124,39 @@ fn read_header(reader: &mut BufReader<File>) -> Result<VaultContext, ReadVaultFi
         )));
     }
 
-    let (bytes_read, name) =
+    let (bytes_read, vaultname) =
         read_string_field(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
     offset += bytes_read as u64;
-    
-    let userkey_iv = read_field::<IV_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+
+    let userkey_iv =
+        read_field::<IV_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
     offset += IV_LENGTH as u64;
 
     //Generate user key based on information gathered
     let user_key = get_user_key(&userkey_iv).map_err(|e| ReadVaultFileError::ReadStdinError(e))?;
 
+    //Get the keyregion nonce for decrypting the keyregion
+    //The keyregion includes both the information about the vault table as well as the master key
+    //This is done to save space in the header and save time on encryption
+    let keyregion_nonce = read_field::<AES_NONCE_LENGTH>(reader)
+        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
 
-    let keyregion = read_field::<ENCRYPTED_REGION_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-    offset += ENCRYPTED_REGION_LENGTH as u64;     
+    let keyregion = read_field::<ENCRYPTED_REGION_LENGTH>(reader)
+        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    offset += ENCRYPTED_REGION_LENGTH as u64;
 
-    //Verify that the keyregion has not been tampered with
-    let mac = read_field::<{hmac::HMAC_SIZE}>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-    hmac::verify_hmac_code(&mac, &keyregion, secret_key) 
     
+    let region_data = decrypt_region(&keyregion, &keyregion_nonce, &user_key).map_err(|e| {
+        ReadVaultFileError::CryptographyError(
+            "The keyregion is corrupted or was modified".to_owned(),
+        )
+    })?;
+    
+   Ok(HeaderInfo { 
+       version, 
+       name: vaultname, 
+       key_region_nonce: keyregion_nonce, 
+       vault_key: region_data[0..VAULTKEY_LENGTH], vault_table_size: () }) 
 }
 
 fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::Error> {
@@ -132,33 +164,6 @@ fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::
     stdin().read_line(&mut pwd)?;
 
     Ok(generate_user_key(pwd, iv))
-}
-
-fn read_table(reader: &mut BufReader<File>) -> Result<Vec<VaultEntry>, ReadVaultFileError> {
-    //The structure of the entries
-    //Directory Entry
-    //Entry Type 1B: 0 = Directory, 1=Entry, 2=SecretEntry
-    //Name 128B
-    //Size 8B
-    //Total = 137B
-    //
-    //Password Entry
-    //Entry Type 1B
-    //Name 128B
-    //BlockId 8B
-    //Total = 137B
-    //
-    //Secret Entry
-    //Entry Type 1B
-    //Name 128B
-    //BlockId 8B
-    //Size 8B
-    // Total = 145B
-    //
-    let entry_id = 0;
-    //read the first entry and panick if it is not a directory -> invalid file
-    let entry = read_field::<VAULTENTRY_LENGTH>(reader)
-        .map_err(|e| ReadVaultFileError::ReadEntryError(e, 0))?;
 }
 
 fn read_string_field(reader: &mut BufReader<File>) -> Result<(usize, String), ReadFieldError> {
