@@ -29,6 +29,7 @@ impl fmt::Display for CryptographyError {
 }
 
 /// Struct that holds the result of an encryption operation
+#[derive(Debug)]
 pub struct EncryptedData<const N: usize> {
     /// The nonce generated in the process
     nonce: [u8; AES_NONCE_LENGTH],
@@ -55,6 +56,14 @@ pub fn decrypt_region<const N: usize>(data: &[u8; N+16], nonce: &[u8; AES_NONCE_
     Ok(get_array_from_vec::<N, u8>(data)?)
 }
 
+pub fn decrypt_region_dyn(data: Vec<u8>, nonce: &[u8; AES_NONCE_LENGTH], key: &[u8]) -> Result<Vec<u8>, CryptographyError> {
+    let key = Key::<Aes256Gcm>::from_slice(key);
+    let cipher = Aes256Gcm::new(key);
+
+    let data = cipher.decrypt(nonce.into(), &data[..]).map_err(|_| CryptographyError::InauthenticTag)?;
+    Ok(data)
+}
+
 /// Encrypt a region with length N. This returns the encrypted data as well as the nonce used.
 /// The resulting Data length will be N+16 bytes long. (Authentication tag) 
 pub fn encrypt_region<const N: usize>(data: &[u8; N], key: &[u8]) -> Result<EncryptedData<{N+16}>, CryptographyError> {
@@ -68,6 +77,7 @@ pub fn encrypt_region<const N: usize>(data: &[u8; N], key: &[u8]) -> Result<Encr
 }
 
 
+/// Get an array from vector if spezifying a specific size
 fn get_array_from_vec<const N: usize, T>(vec: Vec<T>) -> Result<[T; N], CryptographyError>
 where Result<[T;N], CryptographyError>: Sized {
     vec.try_into().map_err(|v: Vec<T>| CryptographyError::InvalidLength { expected: N, actual: v.len()})
