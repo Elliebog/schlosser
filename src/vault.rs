@@ -3,7 +3,7 @@ use crate::crypt::{
     generate_user_key,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{BufRead, BufReader, Read, stdin},
     path::Path,
@@ -38,7 +38,7 @@ struct VaultContext {
     /// Encrypted Vault Key stored inside the schlosser vault file
     enc_vault_key: [u8; 256],
     /// The root vault entry
-    root_entry: VaultEntry,
+    root_entry: DirectoryEntry,
 }
 
 /// Header Information of the archive file
@@ -82,7 +82,7 @@ struct DirectoryEntry {
     /// Name of the directory
     directory_name: String,
     /// Entries that are in the directory
-    children:  Vec<VaultEntry>,
+    children: HashMap<String, VaultEntry>,
 }
 
 /// A vault entry found in the vault entry table
@@ -101,12 +101,14 @@ enum ReadVaultFileError {
     ReadStdinError(std::io::Error),
     InAuthenticTagError(),
     InvalidLengthError(),
+    InternalError(String),
 }
 
 enum InvalidFileReasons {
     InvalidSignature,
     UnsupportedVersion,
     NoRootEntry,
+    InvalidVaultStructure,
     InvalidEntryType,
 }
 
@@ -207,7 +209,7 @@ fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFile
 fn read_vault_table(
     reader: &mut BufReader<File>,
     header: &HeaderInfo,
-) -> Result<VaultContext, ReadVaultFileError> {
+) -> Result<DirectoryEntry, ReadVaultFileError> {
     //Decrypt the vault table. The vault size stored in the header dictates the amount of entries in
     //the vault table. Each entry is 157 bytes long.
     let vault_table = read_dyn_field(reader, header.vault_table_size as usize * VAULTENTRY_LENGTH)
@@ -221,60 +223,105 @@ fn read_vault_table(
     // Because the direntry does not have an entry for size a tuple is used
     // keeping track of the size during loading operations within the directory entry would cause
     // problems down the line when serializing the vault table during save operations
-    let mut dir_stack: VecDeque<(u64, &mut DirectoryEntry)> = VecDeque::new();
-    //First read the root entry (it will always be a directory entry called root)
-    let mut root_entry = match &table[0] {
-        0 => {
-            let mut offset = 1;
-            let name = String::from_utf8(table[offset..offset + VAULTENTRYNAME_LENGTH].to_vec())
-                .map_err(|e| {
-                    ReadVaultFileError::ReadEntryError(ReadFieldError::ReadUtf8Error(e), 0)
-                })?;
-            offset += VAULTENTRYNAME_LENGTH;
+    //
+    //The dir_stack holds the state of the current reading. 0 = entries left to read, 1 = actual
+    //directory entry
+    let mut dir_stack: VecDeque<(u64, DirectoryEntry)> = VecDeque::new();
 
-            let size = u64::from_ne_bytes(
-                table[offset..offset + DIRENTRY_SIZE_LENGTH]
-                    .try_into()
-                    .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
-            );
-            Ok((
-                size,
-                DirectoryEntry {
-                    directory_name: name,
-                    children: Vec::new(),
-                },
-            ))
+    let (root_size, root_entry) = read_entry(
+        table[..VAULTENTRY_LENGTH]
+            .try_into()
+            .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
+    )?;
+    match root_entry {
+        VaultEntry::Directory(dir) => dir_stack.push_front((root_size, dir)),
+        _ => {
+            return Err(ReadVaultFileError::InvalidFile(
+                InvalidFileReasons::NoRootEntry,
+            ));
         }
-        _ => Err(ReadVaultFileError::InvalidFile(
-            InvalidFileReasons::NoRootEntry,
-        )),
-    }?;
-    dir_stack.push_front((root_entry.0, &mut root_entry.1));
+    };
 
-    let cur_dir: &mut (u64, &mut DirectoryEntry) = dir_stack.front_mut().unwrap();
-    let offset = VAULTENTRY_LENGTH;
-
+    let mut offset = VAULTENTRY_LENGTH;
     loop {
-        let (dir_size, entry) = read_entry(table[offset + 1..offset + 1 + VAULTENTRY_LENGTH]
+        let entry = read_entry(
+            table[offset..offset + VAULTENTRY_LENGTH]
                 .try_into()
                 .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
         )?;
+        offset += VAULTENTRY_LENGTH;
         
-        match entry {
-            VaultEntry::Directory(dir) => {
-                //add it to the current directory 
-                let mut_dir = cur_dir.1.children.push_mut(VaultEntry::Directory(dir));
-                //TODO: Find a way to resolve the double mutable borrow
-
-                
+        // save the newly created directory and push it to the queue after the current dir borrow
+        let mut new_dir: Option<(u64, DirectoryEntry)> = None;
+        // Because a repeated retrieval of the head of the queue is not wanted, scopes are used to
+        // get around rusts restriction on double mutable borrows
+        {
+            let cur_dir = dir_stack.front_mut();
+            if cur_dir.is_none() {
+                break Err(ReadVaultFileError::InvalidFile(
+                    InvalidFileReasons::InvalidVaultStructure,
+                ));
             }
-            VaultEntry::Password(pwd) => {
+            let cur_dir = cur_dir.unwrap();
+            match entry.1 {
+                VaultEntry::Password(pwd) => {
+                    cur_dir
+                        .1
+                        .children
+                        .insert(pwd.password_name.clone(), VaultEntry::Password(pwd));
+                }
+                VaultEntry::Secret(sec) => {
+                    cur_dir
+                        .1
+                        .children
+                        .insert(sec.secret_name.clone(), VaultEntry::Secret(sec));
+                }
+                VaultEntry::Directory(dir) => new_dir = Some((entry.0, dir)),
+            };
 
-            }
-            VaultEntry::Secret(sec) => {
+            cur_dir.0 -= 1;
+        }
 
+        if new_dir.is_some() {
+            dir_stack.push_front(new_dir.unwrap());
+        }
+
+        // get the remaining size from the possibly new directory
+        let remaining_size: u64 = {
+            let dir = dir_stack.front_mut();
+            if dir.is_none() {
+                break Err(ReadVaultFileError::InvalidFile(
+                    InvalidFileReasons::InvalidVaultStructure,
+                ));
             }
-        } 
+            dir.unwrap().0
+        };
+
+        // if 0 => Current dir is finished add it to the previous layer as a child
+        if remaining_size == 0 {
+            if dir_stack.len() == 1 {
+                // we are at root and we are finished
+                break Ok(dir_stack.pop_front().unwrap().1);
+            }
+            let res_dir = dir_stack.pop_front();
+            if res_dir.is_none() {
+                break Err(ReadVaultFileError::InternalError(String::from(
+                    "Vault table read",
+                )));
+            }
+            let dir = res_dir.unwrap().1;
+            {
+                let cur_dir = dir_stack.front_mut();
+                if cur_dir.is_none() {
+                    break Err(ReadVaultFileError::InvalidFile(
+                        InvalidFileReasons::InvalidVaultStructure,
+                    ));
+                }
+                cur_dir.unwrap().1
+                    .children
+                    .insert(dir.directory_name.clone(), VaultEntry::Directory(dir));
+            }
+        }
     }
 }
 
@@ -299,7 +346,7 @@ fn read_entry(
                 size,
                 VaultEntry::Directory(DirectoryEntry {
                     directory_name: name,
-                    children: Vec::new(),
+                    children: HashMap::new(),
                 }),
             ))
         }
