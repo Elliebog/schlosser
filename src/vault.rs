@@ -2,13 +2,13 @@ use crate::crypt::{
     AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
 use crate::error::{InvalidFileReasons, ReadFieldError, ReadVaultFileError, VaultManagementError};
+use std::fmt::{Write};
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{BufRead, BufReader, Read, stdin},
+    io::{BufReader, Read, stdin},
     path::Path,
 };
-use std::fmt::Write;
 
 // General Constants
 const AES_GCM_AUTH_TAG: usize = 16;
@@ -35,8 +35,12 @@ const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + IV_LENGTH
     + AES_NONCE_LENGTH
     + ENCRYPTED_REGION_LENGTH;
+// Vault string constants
+const V_CONNECTOR: &str = "│\t";
+const LITERAL: &str = "├─ ";
+const END_LITERAL: &str = "└ ";
 
-/// Maint Entry point that manages vault information about a schlosser vault 
+/// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
 struct VaultManager {
     /// Version of the archive structure
@@ -71,13 +75,53 @@ impl VaultManager {
         })
     }
 
-    pub fn get_vault_info(&self) -> Result<String, VaultManagementError>{
-        let mut out: String =  format!("{} Archive", self.name);
-        write!(&mut out, "test").map_err(|_| VaultManagementError::WriteError)?;
-        dire
+    pub fn get_vault_info(&self) -> Result<String, VaultManagementError> {
+        let mut out: String = format!("{} Archive", self.name);
+
+        // Iterate through the directory and gather information
+        // Entries are normally not sorted 
+        let mut sorted_dir_stack: VecDeque<VecDeque<&VaultEntry>> = VecDeque::new();
+        sorted_dir_stack.push_front(self.root_entry.get_sorted_children().into());
+
+        loop {
+            let cur_dir = sorted_dir_stack.front_mut();
+            if cur_dir.is_none() {
+                //break if there is no more directories -> finished
+                break;
+            }
+            let cur_dir = cur_dir.unwrap();
+            let entry = cur_dir.pop_front();
+            // get is_empty earlier due to our usage of sorted_dir_stack alter (borrow-checker issue)
+            let is_empty = cur_dir.is_empty();
+            if entry.is_none() {
+                // Directory is finished
+                sorted_dir_stack.pop_front();
+            } else {
+                // build a prefix string to give a pretty view
+                // similar-ish to `pstree`
+                let prefix_str = build_prefix_str(sorted_dir_stack.len() as u64 - 1, is_empty);
+                write!(&mut out, "{} {}", prefix_str, entry.unwrap().display())
+                    .map_err(|_| VaultManagementError::WriteError)?;
+            }
+        }
+        Ok(out)
     }
+
+    // pub fn retrieve_entry(&self, entry_path: String) {
+    //     // An Entry Path is a string seperated by slashes
+    //     let cur_dir: &DirectoryEntry = &self.root_entry;
+    //     for item in entry_path.split('/') {
+    //         cur_dir.children.get 
+    //     }
+    //
+    // }
 }
 
+trait Entry<T> {
+    fn display(&self) -> String;
+    //fn retrieve_secret(&self, reader: &mut BufReader<File>) -> T; 
+    //fn serialize(&self) -> [u8; VAULTENTRY_LENGTH];
+}
 
 /// Header Information of the archive file
 #[derive(Debug)]
@@ -88,14 +132,14 @@ struct HeaderInfo {
     name: String,
     /// Key Region nonce
     key_region_nonce: [u8; AES_NONCE_LENGTH],
-    // Decrypted vault key
+    /// Decrypted vault key
     vault_key: [u8; VAULTKEY_LENGTH],
     vault_table_size: u64,
     vault_table_nonce: [u8; AES_NONCE_LENGTH],
 }
 
 /// Entry that holds a password
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PasswordEntry {
     /// Name of the password
     password_name: String,
@@ -103,9 +147,14 @@ struct PasswordEntry {
     secret_block_id: u64,
 }
 
+impl Entry<PasswordEntry> for PasswordEntry {
+    fn display(&self) -> String {
+        format!("{} (Password)", self.password_name)
+    }
+}
 /// Entry for an encrypted Secret File (like a recovery key or a keyfile, or any other kind of file
 /// that needs to be kept secure)
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct SecretFileEntry {
     /// Name of the secret
     secret_name: String,
@@ -114,22 +163,109 @@ struct SecretFileEntry {
     size: u64,
 }
 
+impl Entry<SecretFileEntry> for SecretFileEntry {
+    fn display(&self) -> String {
+        format!("{} (File)", self.secret_name)
+    }
+}
+
 /// Entry that represents a directory in the vault structure
 #[derive(Debug)]
 struct DirectoryEntry {
     /// Name of the directory
     directory_name: String,
-    /// Entries that are in the directory
+    /// Entries that are in the directory. A Hashmap is used to facilitate faster password and
+    /// secret lookups
     children: HashMap<String, VaultEntry>,
+}
+
+impl Entry<DirectoryEntry> for DirectoryEntry {
+    fn display(&self) -> String {
+        format!(
+            "{} (Dir) {} Items",
+            self.directory_name,
+            self.children.len()
+        )
+    }
+}
+
+impl PartialEq for DirectoryEntry {
+    fn eq(&self, other: &Self) -> bool {
+        if self.directory_name != self.directory_name {
+            return false;
+        }
+        let other_values: Vec<&VaultEntry> = other.children.values().collect();
+        let self_values: Vec<&VaultEntry> = self.children.values().collect();
+        other_values == self_values
+    }
+}
+impl Eq for DirectoryEntry {}
+
+impl DirectoryEntry {
+    fn get_sorted_children<'a>(&'a self) -> Vec<&'a VaultEntry> {
+        let mut entries: Vec<&'a VaultEntry> = self.children.values().collect();
+        entries.sort_by(|a, b| a.cmp(b));
+        entries
+    }
 }
 
 /// A vault entry found in the vault entry table
 /// Each entry is 128+8+8 bytes long
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum VaultEntry {
     Password(PasswordEntry),
     Secret(SecretFileEntry),
     Directory(DirectoryEntry),
+}
+
+impl VaultEntry {
+    fn display(&self) -> String {
+        match self {
+            Self::Password(pwd) => pwd.display(),
+            Self::Secret(sec) => sec.display(),
+            Self::Directory(dir) => dir.display(),
+        }
+    }
+}
+
+impl PartialOrd for VaultEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VaultEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (VaultEntry::Password(pwd1), VaultEntry::Password(pwd2)) => {
+                pwd1.password_name.cmp(&pwd2.password_name)
+            }
+            (VaultEntry::Password(pwd), VaultEntry::Secret(sec)) => {
+                pwd.password_name.cmp(&sec.secret_name)
+            }
+            (VaultEntry::Password(pwd), VaultEntry::Directory(dir)) => {
+                pwd.password_name.cmp(&dir.directory_name)
+            }
+            (VaultEntry::Secret(sec), VaultEntry::Password(pwd)) => {
+                sec.secret_name.cmp(&pwd.password_name)
+            }
+            (VaultEntry::Secret(sec1), VaultEntry::Secret(sec2)) => {
+                sec1.secret_name.cmp(&sec2.secret_name)
+            }
+            (VaultEntry::Secret(sec), VaultEntry::Directory(dir)) => {
+                sec.secret_name.cmp(&dir.directory_name)
+            }
+            (VaultEntry::Directory(dir), VaultEntry::Password(pwd)) => {
+                dir.directory_name.cmp(&pwd.password_name)
+            }
+            (VaultEntry::Directory(dir), VaultEntry::Secret(sec)) => {
+                dir.directory_name.cmp(&sec.secret_name)
+            }
+            (VaultEntry::Directory(dir1), VaultEntry::Directory(dir2)) => {
+                dir1.directory_name.cmp(&dir2.directory_name)
+            }
+        }
+    }
 }
 
 /// Read the vault archive file header.
@@ -159,8 +295,8 @@ fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFile
         ));
     }
 
-    let  vaultname_raw =
-        read_field::<VAULTNAME_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    let vaultname_raw = read_field::<VAULTNAME_LENGTH>(reader)
+        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
     let vaultname = String::from_utf8(vaultname_raw.to_vec());
     offset += VAULTNAME_LENGTH as u64;
 
@@ -449,4 +585,18 @@ fn read_dyn_field(reader: &mut BufReader<File>, len: usize) -> Result<Vec<u8>, R
     }
 
     Ok(buffer)
+}
+
+fn build_prefix_str(depth: u64, end_leaf: bool) -> String {
+    let mut prefix = String::new();
+    if end_leaf {
+        prefix.insert_str(0, END_LITERAL);
+    } else {
+        prefix.insert_str(0, LITERAL);
+    }
+
+    for _ in 0..depth {
+        prefix.insert_str(0, V_CONNECTOR);
+    }
+    prefix
 }
