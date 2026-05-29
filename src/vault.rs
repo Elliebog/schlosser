@@ -1,14 +1,15 @@
 use crate::crypt::{
-    AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, encrypt_region,
-    generate_user_key,
+    AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
+use crate::error::{InvalidFileReasons, ReadFieldError, ReadVaultFileError, VaultManagementError};
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{BufRead, BufReader, Read, stdin},
     path::Path,
-    string::FromUtf8Error,
 };
+use std::fmt::Write;
+
 // General Constants
 const AES_GCM_AUTH_TAG: usize = 16;
 // Header Constants
@@ -27,19 +28,56 @@ const VAULTENTRYTYPE_LENGTH: usize = 1;
 const DIRENTRY_SIZE_LENGTH: usize = 8;
 const BLOCKID_LENGTH: usize = 8;
 const SECRET_SIZE_LENGTH: usize = 8;
+// Vault data constants
+const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
+    + VAULT_VERSION_LENGTH
+    + VAULTNAME_LENGTH
+    + IV_LENGTH
+    + AES_NONCE_LENGTH
+    + ENCRYPTED_REGION_LENGTH;
 
-/// Contextual Information about a schlosser vault also called a schlosser archive
+/// Maint Entry point that manages vault information about a schlosser vault 
 #[derive(Debug)]
-struct VaultContext {
+struct VaultManager {
     /// Version of the archive structure
     version: u8,
     /// Name of the Vault
     name: String,
     /// Encrypted Vault Key stored inside the schlosser vault file
-    enc_vault_key: [u8; 256],
+    enc_vault_key: [u8; VAULTKEY_LENGTH],
+    /// Size of the vault info region (header + vault table)
+    data_start: u64,
     /// The root vault entry
     root_entry: DirectoryEntry,
 }
+
+impl VaultManager {
+    pub fn from_file(file_path: &str) -> Result<VaultManager, ReadVaultFileError> {
+        let path = Path::new(file_path);
+        let file = match File::open(path) {
+            Err(err) => panic!("Could not open file {}: {}", path.display(), err),
+            Ok(file) => file,
+        };
+        let mut reader = BufReader::new(file);
+        let header_info: HeaderInfo = read_header(&mut reader)?;
+        let root_entry: DirectoryEntry = read_vault_table(&mut reader, &header_info)?;
+        Ok(VaultManager {
+            version: header_info.version,
+            name: header_info.name,
+            enc_vault_key: header_info.vault_key,
+            data_start: header_info.vault_table_size * VAULTENTRY_LENGTH as u64
+                + HEADER_LENGTH as u64,
+            root_entry,
+        })
+    }
+
+    pub fn get_vault_info(&self) -> Result<String, VaultManagementError>{
+        let mut out: String =  format!("{} Archive", self.name);
+        write!(&mut out, "test").map_err(|_| VaultManagementError::WriteError)?;
+        dire
+    }
+}
+
 
 /// Header Information of the archive file
 #[derive(Debug)]
@@ -94,42 +132,6 @@ enum VaultEntry {
     Directory(DirectoryEntry),
 }
 
-enum ReadVaultFileError {
-    ReadError(ReadFieldError, u64),
-    ReadEntryError(ReadFieldError, u64),
-    InvalidFile(InvalidFileReasons),
-    ReadStdinError(std::io::Error),
-    InAuthenticTagError(),
-    InvalidLengthError(),
-    InternalError(String),
-}
-
-enum InvalidFileReasons {
-    InvalidSignature,
-    UnsupportedVersion,
-    NoRootEntry,
-    InvalidVaultStructure,
-    InvalidEntryType,
-}
-
-enum ReadFieldError {
-    ReadFileError(std::io::Error),
-    ReadUtf8Error(FromUtf8Error),
-    UnexpectedEOFError(),
-}
-
-impl VaultContext {
-    pub fn from_file(file_path: &str) -> Result<VaultContext, ReadVaultFileError> {
-        let path = Path::new(file_path);
-        let mut file = match File::open(&path) {
-            Err(err) => panic!("Could not open file {}: {}", path.display(), err),
-            Ok(file) => file,
-        };
-        let mut reader = BufReader::new(file);
-        let offset: u64 = 0;
-    }
-}
-
 /// Read the vault archive file header.
 /// This expects the Bufreader to be at the start of the file
 fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFileError> {
@@ -157,9 +159,10 @@ fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFile
         ));
     }
 
-    let (bytes_read, vaultname) =
-        read_string_field(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-    offset += bytes_read as u64;
+    let  vaultname_raw =
+        read_field::<VAULTNAME_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    let vaultname = String::from_utf8(vaultname_raw.to_vec());
+    offset += VAULTNAME_LENGTH as u64;
 
     let userkey_iv =
         read_field::<IV_LENGTH>(reader).map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
@@ -206,6 +209,10 @@ fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFile
     })
 }
 
+/// Read the vault table using an iterative approach
+/// Returns the root entry as a directory
+/// If the table has an invalid structure (No Root Entry or incorrect sizes of directory entries)
+/// InvalidFile errors are returned
 fn read_vault_table(
     reader: &mut BufReader<File>,
     header: &HeaderInfo,
@@ -250,7 +257,7 @@ fn read_vault_table(
                 .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
         )?;
         offset += VAULTENTRY_LENGTH;
-        
+
         // save the newly created directory and push it to the queue after the current dir borrow
         let mut new_dir: Option<(u64, DirectoryEntry)> = None;
         // Because a repeated retrieval of the head of the queue is not wanted, scopes are used to
@@ -317,7 +324,9 @@ fn read_vault_table(
                         InvalidFileReasons::InvalidVaultStructure,
                     ));
                 }
-                cur_dir.unwrap().1
+                cur_dir
+                    .unwrap()
+                    .1
                     .children
                     .insert(dir.directory_name.clone(), VaultEntry::Directory(dir));
             }
@@ -325,6 +334,7 @@ fn read_vault_table(
     }
 }
 
+/// Convert a raw u8 slice of length `VAULT_ENTRY_LENGTH` to a VaultEntry
 fn read_entry(
     entry_data: [u8; VAULTENTRY_LENGTH],
 ) -> Result<(u64, VaultEntry), ReadVaultFileError> {
@@ -405,6 +415,7 @@ fn read_entry(
     }
 }
 
+/// Get the user key based on an initialization vector using PBKDF2 algorithm
 fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::Error> {
     let mut pwd: String = String::new();
     stdin().read_line(&mut pwd)?;
@@ -412,16 +423,8 @@ fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::
     Ok(generate_user_key(pwd, iv))
 }
 
-fn read_string_field(reader: &mut BufReader<File>) -> Result<(usize, String), ReadFieldError> {
-    let mut buffer: Vec<u8> = Vec::new();
-    //Read bytes until the string delimiter is found
-    let read_bytes = reader
-        .read_until(0x00, &mut buffer)
-        .map_err(|e| ReadFieldError::ReadFileError(e))?;
-    let field = String::from_utf8(buffer).map_err(|e| ReadFieldError::ReadUtf8Error(e))?;
-    Ok((read_bytes, field))
-}
-
+/// Read a field of specific size from a buffered reader and return the contents in a fixed size
+/// array
 fn read_field<const length: usize>(
     reader: &mut BufReader<File>,
 ) -> Result<[u8; length], ReadFieldError> {
@@ -435,7 +438,7 @@ fn read_field<const length: usize>(
     Ok(buffer)
 }
 
-/// Reads a field of size only known at compile time and returns the result
+/// Reads a field of size only known at compile time and returns the result as a vector of bytes
 fn read_dyn_field(reader: &mut BufReader<File>, len: usize) -> Result<Vec<u8>, ReadFieldError> {
     let mut buffer: Vec<u8> = vec![0; len];
     let bytes_read = reader

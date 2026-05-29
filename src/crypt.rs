@@ -1,7 +1,7 @@
-use core::fmt;
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, aead::{Aead, OsRng}};
 use pbkdf2::{pbkdf2_hmac_array};
 use sha2::Sha256;
+use crate::error::CryptographyError;
 
 /// The length of the initialization Vector designed to be used in PBKDF2 key generation
 pub const IV_LENGTH: usize = 16;
@@ -9,24 +9,6 @@ const PBKDF2_ITERATIONS: usize = 300000;
 const KEY_LENGTH: usize = 32;
 pub const AES_NONCE_LENGTH: usize = 12;
 
-enum CryptographyError {
-    InauthenticTag,
-    InvalidLength{
-        expected: usize,
-        actual: usize,
-    }
-}
-
-impl fmt::Display for CryptographyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InauthenticTag => 
-                write!(f, "Authentication tag corrupted"),
-            Self::InvalidLength { expected, actual } => 
-                write!(f, "Mismatch when converting data: expected {} but got {}", expected, actual)
-        }
-    }
-}
 
 /// Struct that holds the result of an encryption operation
 #[derive(Debug)]
@@ -48,7 +30,7 @@ pub fn generate_user_key(password: String, iv: &[u8; IV_LENGTH]) -> [u8; KEY_LEN
 /// for generic const expressions still being experimental
 pub fn decrypt_region<const N: usize>(data: &[u8; N+16], nonce: &[u8; AES_NONCE_LENGTH], key: &[u8]) -> Result<[u8; N], CryptographyError> {
     let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(&key);
+    let cipher = Aes256Gcm::new(key);
 
     //Decrypt the target data and truncate to exclude the authentication tag
     let mut data = cipher.decrypt(nonce.into(), &data[..]).map_err(|_| CryptographyError::InauthenticTag)?;
@@ -56,6 +38,8 @@ pub fn decrypt_region<const N: usize>(data: &[u8; N+16], nonce: &[u8; AES_NONCE_
     Ok(get_array_from_vec::<N, u8>(data)?)
 }
 
+/// Decrypt a region of dynamic size.
+/// No size guarantee is provided on the returned result (Vector)
 pub fn decrypt_region_dyn(data: Vec<u8>, nonce: &[u8; AES_NONCE_LENGTH], key: &[u8]) -> Result<Vec<u8>, CryptographyError> {
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);
@@ -68,7 +52,7 @@ pub fn decrypt_region_dyn(data: Vec<u8>, nonce: &[u8; AES_NONCE_LENGTH], key: &[
 /// The resulting Data length will be N+16 bytes long. (Authentication tag) 
 pub fn encrypt_region<const N: usize>(data: &[u8; N], key: &[u8]) -> Result<EncryptedData<{N+16}>, CryptographyError> {
     let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(&key);
+    let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let encrypted_data = cipher.encrypt(&nonce, &data[..]).map_err(|_| CryptographyError::InauthenticTag)?;
     let encrypted_data = get_array_from_vec::<{N+16}, u8>(encrypted_data)?;
