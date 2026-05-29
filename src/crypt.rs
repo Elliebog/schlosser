@@ -27,7 +27,6 @@ pub fn generate_user_key(password: String, iv: &[u8; IV_LENGTH]) -> [u8; KEY_LEN
 
 /// Decrypt a region where N is the target amount of bytes (excluding authentication tag).
 /// This function uses experimental features such as computations with const generics 
-/// for generic const expressions still being experimental
 pub fn decrypt_region<const N: usize>(data: &[u8; N+16], nonce: &[u8; AES_NONCE_LENGTH], key: &[u8]) -> Result<[u8; N], CryptographyError> {
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);

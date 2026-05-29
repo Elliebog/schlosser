@@ -21,6 +21,7 @@ impl fmt::Display for CryptographyError {
 
 pub enum ReadVaultFileError {
     ReadError(ReadFieldError, u64),
+    ReadFileError(std::io::Error),
     ReadEntryError(ReadFieldError, u64),
     InvalidFile(InvalidFileReasons),
     ReadStdinError(std::io::Error),

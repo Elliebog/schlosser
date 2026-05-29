@@ -1,8 +1,11 @@
+use bytes::{BufMut, BytesMut};
+
 use crate::crypt::{
     AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
 use crate::error::{InvalidFileReasons, ReadFieldError, ReadVaultFileError, VaultManagementError};
-use std::fmt::{Write};
+use std::fmt::Write;
+use std::io::{Seek, SeekFrom};
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
@@ -22,6 +25,9 @@ const VAULTKEY_LENGTH: usize = 32;
 const VAULTTABLE_INFO_LENGTH: usize = 8; //512 bit
 const ENCRYPTED_REGION_LENGTH: usize = VAULTKEY_LENGTH + VAULTTABLE_INFO_LENGTH + AES_GCM_AUTH_TAG; //Key + VT size + authentication TAGLength
 // Vault Table Constants
+const PASSWORDENTRY_TYPE: u8 = 0;
+const SECRETENTRY_TYPE: u8 = 1;
+const DIRENTRY_TYPE: u8 = 2;
 const VAULTENTRY_LENGTH: usize = 157;
 const VAULTENTRYNAME_LENGTH: usize = 128;
 const VAULTENTRYTYPE_LENGTH: usize = 1;
@@ -35,6 +41,9 @@ const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + IV_LENGTH
     + AES_NONCE_LENGTH
     + ENCRYPTED_REGION_LENGTH;
+const DATABLOCK_RAW_LENGTH: usize = 256;
+const DATABLOCK_ENC_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
+const DATABLOCK_LENGTH: usize = DATABLOCK_ENC_LENGTH + AES_NONCE_LENGTH;
 // Vault string constants
 const V_CONNECTOR: &str = "│\t";
 const LITERAL: &str = "├─ ";
@@ -79,7 +88,7 @@ impl VaultManager {
         let mut out: String = format!("{} Archive", self.name);
 
         // Iterate through the directory and gather information
-        // Entries are normally not sorted 
+        // Entries are normally not sorted
         let mut sorted_dir_stack: VecDeque<VecDeque<&VaultEntry>> = VecDeque::new();
         sorted_dir_stack.push_front(self.root_entry.get_sorted_children().into());
 
@@ -107,20 +116,19 @@ impl VaultManager {
         Ok(out)
     }
 
-    // pub fn retrieve_entry(&self, entry_path: String) {
-    //     // An Entry Path is a string seperated by slashes
-    //     let cur_dir: &DirectoryEntry = &self.root_entry;
-    //     for item in entry_path.split('/') {
-    //         cur_dir.children.get 
-    //     }
-    //
-    // }
+    pub fn retrieve_entry(&self, entry_path: String) {
+        // An Entry Path is a string seperated by slashes
+        let cur_dir: &DirectoryEntry = &self.root_entry;
+        for item in entry_path.split('/') {
+            cur_dir.children.get
+        }
+    }
 }
 
 trait Entry<T> {
     fn display(&self) -> String;
-    //fn retrieve_secret(&self, reader: &mut BufReader<File>) -> T; 
-    //fn serialize(&self) -> [u8; VAULTENTRY_LENGTH];
+    fn retrieve_secret(&self, reader: &mut BufReader<File>, data_start: u64, key: &[u8]) -> Result<T, ReadVaultFileError>;
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError>;
 }
 
 /// Header Information of the archive file
@@ -147,11 +155,47 @@ struct PasswordEntry {
     secret_block_id: u64,
 }
 
-impl Entry<PasswordEntry> for PasswordEntry {
+impl Entry<String> for PasswordEntry {
     fn display(&self) -> String {
         format!("{} (Password)", self.password_name)
     }
+
+    fn retrieve_secret(
+        &self,
+        reader: &mut BufReader<File>,
+        data_start: u64,
+        key: &[u8],
+    ) -> Result<String, ReadVaultFileError> {
+        let offset = reader
+            .seek(SeekFrom::Start(
+                data_start + self.secret_block_id * DATABLOCK_LENGTH as u64,
+            ))
+            .map_err(|e| ReadVaultFileError::ReadFileError(e))?;
+        let enc_data_res = read_field::<DATABLOCK_ENC_LENGTH>(reader)
+            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+        let nonce = read_field::<AES_NONCE_LENGTH>(reader)
+            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+        let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
+            .map_err(|_| ReadVaultFileError::InAuthenticTagError())?;
+
+        // Passwords are encrypted by first padding the field with 0's
+        // To get the original password we discard anything that is not ascii
+        String::from_utf8(data.to_vec())
+            .map_err(|e| ReadVaultFileError::ReadError(ReadFieldError::ReadUtf8Error(e), 0))
+    }
+
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
+        let mut entry = BytesMut::zeroed(VAULTENTRY_LENGTH);
+        entry.put_u8(PASSWORDENTRY_TYPE);
+        entry.put(self.password_name.as_bytes());
+        entry.put_u64(self.secret_block_id);
+        match entry.as_array::<VAULTENTRY_LENGTH>() {
+            Some(e) => Ok(e.to_owned()),
+            None => Err(ReadVaultFileError::InvalidLengthError())
+        } 
+    }
 }
+
 /// Entry for an encrypted Secret File (like a recovery key or a keyfile, or any other kind of file
 /// that needs to be kept secure)
 #[derive(Debug, PartialEq, Eq)]
@@ -166,6 +210,12 @@ struct SecretFileEntry {
 impl Entry<SecretFileEntry> for SecretFileEntry {
     fn display(&self) -> String {
         format!("{} (File)", self.secret_name)
+    }
+
+    fn retrieve_secret(&self, reader: &mut BufReader<File>, data_start: u64, key: &[u8]) -> Result<SecretFileEntry, ReadVaultFileError> {
+        
+        //TODO: Implement Entry trait for Directory and SecretFile 
+        //TODO: Refactor if necessary some of the array shenanigans using BytesMut
     }
 }
 
@@ -475,7 +525,7 @@ fn read_entry(
     entry_data: [u8; VAULTENTRY_LENGTH],
 ) -> Result<(u64, VaultEntry), ReadVaultFileError> {
     match entry_data[0] {
-        0 => {
+        DIRENTRY_TYPE => {
             // Directory Entry
             let mut offset = 1;
             let name = String::from_utf8(entry_data[offset..offset + VAULTENTRY_LENGTH].to_vec())
@@ -496,7 +546,7 @@ fn read_entry(
                 }),
             ))
         }
-        1 => {
+        PASSWORDENTRY_TYPE => {
             //Password Entry
             let mut offset = 1;
             let name = String::from_utf8(entry_data[offset..offset + VAULTENTRY_LENGTH].to_vec())
@@ -517,7 +567,7 @@ fn read_entry(
                 }),
             ))
         }
-        2 => {
+        SECRETENTRY_TYPE => {
             //Secret File Entry
             let mut offset = 1;
             let name = String::from_utf8(entry_data[offset..offset + VAULTENTRY_LENGTH].to_vec())
