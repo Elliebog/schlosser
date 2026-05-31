@@ -127,7 +127,12 @@ impl VaultManager {
 
 trait Entry<T> {
     fn display(&self) -> String;
-    fn retrieve_secret(&self, reader: &mut BufReader<File>, data_start: u64, key: &[u8]) -> Result<T, ReadVaultFileError>;
+    fn retrieve_secret(
+        &self,
+        reader: &mut BufReader<File>,
+        data_start: u64,
+        key: &[u8],
+    ) -> Result<T, ReadVaultFileError>;
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError>;
 }
 
@@ -191,8 +196,8 @@ impl Entry<String> for PasswordEntry {
         entry.put_u64(self.secret_block_id);
         match entry.as_array::<VAULTENTRY_LENGTH>() {
             Some(e) => Ok(e.to_owned()),
-            None => Err(ReadVaultFileError::InvalidLengthError())
-        } 
+            None => Err(ReadVaultFileError::InvalidLengthError()),
+        }
     }
 }
 
@@ -212,9 +217,14 @@ impl Entry<SecretFileEntry> for SecretFileEntry {
         format!("{} (File)", self.secret_name)
     }
 
-    fn retrieve_secret(&self, reader: &mut BufReader<File>, data_start: u64, key: &[u8]) -> Result<SecretFileEntry, ReadVaultFileError> {
-        
-        //TODO: Implement Entry trait for Directory and SecretFile 
+    fn retrieve_secret(
+        &self,
+        reader: &mut BufReader<File>,
+        data_start: u64,
+        key: &[u8],
+    ) -> Result<SecretFileEntry, ReadVaultFileError> {
+
+        //TODO: Implement Entry trait for Directory and SecretFile
         //TODO: Refactor if necessary some of the array shenanigans using BytesMut
     }
 }
@@ -607,6 +617,24 @@ fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::
     stdin().read_line(&mut pwd)?;
 
     Ok(generate_user_key(pwd, iv))
+}
+
+/// Reads a data block from the data section of the vault archive
+/// the is expected to be instantiated on the vault file
+/// `data_blocK-start` is the offset in bytes from file start to target data block start
+/// The key is the AES-GCM key used to decrypt the file
+/// The nonce is read automatically from the data block section
+fn read_data_block(reader: &mut BufReader<File>, data_block_start: u64, key: &[u8]) -> Result<[u8; DATABLOCK_RAW_LENGTH], ReadVaultFileError> {
+    let offset = reader
+        .seek(SeekFrom::Start(data_block_start))
+        .map_err(|e| ReadVaultFileError::ReadFileError(e))?;
+    let enc_data_res = read_field::<DATABLOCK_ENC_LENGTH>(reader)
+        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    let nonce = read_field::<AES_NONCE_LENGTH>(reader)
+        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
+    let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
+        .map_err(|_| ReadVaultFileError::InAuthenticTagError())?;
+    Ok(data)
 }
 
 /// Read a field of specific size from a buffered reader and return the contents in a fixed size
