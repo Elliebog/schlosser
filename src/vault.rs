@@ -1,4 +1,4 @@
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::crypt::{
     AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
@@ -56,31 +56,31 @@ struct VaultManager {
     version: u8,
     /// Name of the Vault
     name: String,
-    /// Encrypted Vault Key stored inside the schlosser vault file
-    enc_vault_key: [u8; VAULTKEY_LENGTH],
+    /// Master vault Key
+    vault_key: [u8; VAULTKEY_LENGTH],
     /// Size of the vault info region (header + vault table)
     data_start: u64,
     /// The root vault entry
     root_entry: DirectoryEntry,
+    /// The path to the archive file
+    vault_path: String,
 }
 
 impl VaultManager {
     pub fn from_file(file_path: &str) -> Result<VaultManager, ReadVaultFileError> {
         let path = Path::new(file_path);
-        let file = match File::open(path) {
-            Err(err) => panic!("Could not open file {}: {}", path.display(), err),
-            Ok(file) => file,
-        };
+        let file = File::open(path).map_err(|e| ReadVaultFileError::ReadFileError(e))?;
         let mut reader = BufReader::new(file);
         let header_info: HeaderInfo = read_header(&mut reader)?;
         let root_entry: DirectoryEntry = read_vault_table(&mut reader, &header_info)?;
         Ok(VaultManager {
             version: header_info.version,
             name: header_info.name,
-            enc_vault_key: header_info.vault_key,
+            vault_key: header_info.vault_key,
             data_start: header_info.vault_table_size * VAULTENTRY_LENGTH as u64
                 + HEADER_LENGTH as u64,
             root_entry,
+            vault_path: file_path.to_owned(),
         })
     }
 
@@ -116,13 +116,46 @@ impl VaultManager {
         Ok(out)
     }
 
-    pub fn retrieve_entry(&self, entry_path: String) {
+    pub fn retrieve_entry(&self, entry_path: String) -> Result<EntryResult, VaultManagementError> {
+        let file = File::open(Path::new(&self.vault_path))
+            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
+        let mut reader = BufReader::new(file);
+
         // An Entry Path is a string seperated by slashes
-        let cur_dir: &DirectoryEntry = &self.root_entry;
-        for item in entry_path.split('/') {
-            cur_dir.children.get
-        }
+        let mut cur_dir: &DirectoryEntry = &self.root_entry;
+        let mut path: VecDeque<&str> = entry_path.split('/').collect();
+        let mut final_entry: Option<&VaultEntry> = None;
+        let target_entry = loop {
+            let name = path.pop_front();
+            if name.is_none() {
+                break match final_entry {
+                    None => Err(VaultManagementError::EntryNotFound(entry_path.clone())),
+                    Some(e) => Ok(e),
+                };
+            }
+
+            //search current directory 
+            let entry = cur_dir.children.get(name.unwrap());
+            if entry.is_none() {
+                break Err(VaultManagementError::EntryNotFound(entry_path.clone()))
+            }
+            
+            let entry = entry.unwrap();
+            if let VaultEntry::Directory(dir) = entry {
+               cur_dir = dir; 
+            }
+
+            final_entry = Some(entry);
+        }?;
+        
+        target_entry.retrieve_secret(&mut reader, self.data_start, &self.vault_key)
+            .map_err(|e| VaultManagementError::VaultError(e))
     }
+}
+enum EntryResult {
+    Password(String),
+    Secret(Bytes),
+    Directory(String),
 }
 
 trait Entry<T> {
@@ -158,6 +191,8 @@ struct PasswordEntry {
     password_name: String,
     /// Id of the secret block
     secret_block_id: u64,
+    /// Nonce used for decryption of the datablock
+    nonce: [u8; AES_NONCE_LENGTH],
 }
 
 impl Entry<String> for PasswordEntry {
@@ -171,17 +206,8 @@ impl Entry<String> for PasswordEntry {
         data_start: u64,
         key: &[u8],
     ) -> Result<String, ReadVaultFileError> {
-        let offset = reader
-            .seek(SeekFrom::Start(
-                data_start + self.secret_block_id * DATABLOCK_LENGTH as u64,
-            ))
-            .map_err(|e| ReadVaultFileError::ReadFileError(e))?;
-        let enc_data_res = read_field::<DATABLOCK_ENC_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-        let nonce = read_field::<AES_NONCE_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-        let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
-            .map_err(|_| ReadVaultFileError::InAuthenticTagError())?;
+        let data_block_start = data_start + self.secret_block_id * DATABLOCK_LENGTH as u64;
+        let data = read_data_block(reader, data_block_start, key, &self.nonce)?;
 
         // Passwords are encrypted by first padding the field with 0's
         // To get the original password we discard anything that is not ascii
@@ -194,6 +220,7 @@ impl Entry<String> for PasswordEntry {
         entry.put_u8(PASSWORDENTRY_TYPE);
         entry.put(self.password_name.as_bytes());
         entry.put_u64(self.secret_block_id);
+        entry.put(&self.nonce[..]);
         match entry.as_array::<VAULTENTRY_LENGTH>() {
             Some(e) => Ok(e.to_owned()),
             None => Err(ReadVaultFileError::InvalidLengthError()),
@@ -209,10 +236,13 @@ struct SecretFileEntry {
     secret_name: String,
     /// Id of the starting secret block
     secret_block_id: u64,
+    /// Length of the secret file
     size: u64,
+    /// Nonce used for decryption of the datablocks
+    nonce: [u8; AES_NONCE_LENGTH],
 }
 
-impl Entry<SecretFileEntry> for SecretFileEntry {
+impl Entry<Bytes> for SecretFileEntry {
     fn display(&self) -> String {
         format!("{} (File)", self.secret_name)
     }
@@ -222,10 +252,28 @@ impl Entry<SecretFileEntry> for SecretFileEntry {
         reader: &mut BufReader<File>,
         data_start: u64,
         key: &[u8],
-    ) -> Result<SecretFileEntry, ReadVaultFileError> {
+    ) -> Result<Bytes, ReadVaultFileError> {
+        let mut bytes: BytesMut = BytesMut::zeroed(self.size as usize * DATABLOCK_RAW_LENGTH);
+        for i in 0..self.size {
+            let data_start = data_start + (self.secret_block_id + i) * DATABLOCK_LENGTH as u64;
+            let data = read_data_block(reader, data_start, key, &self.nonce)?;
+            bytes.put(&data[..]);
+        }
 
-        //TODO: Implement Entry trait for Directory and SecretFile
-        //TODO: Refactor if necessary some of the array shenanigans using BytesMut
+        Ok(bytes.freeze())
+    }
+
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
+        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
+        bytes.put_u8(SECRETENTRY_TYPE);
+        bytes.put(self.secret_name.as_bytes());
+        bytes.put_u64(self.secret_block_id);
+        bytes.put_u64(self.size);
+        bytes.put(&self.nonce[..]);
+        match bytes.as_array::<VAULTENTRY_LENGTH>() {
+            Some(e) => Ok(e.to_owned()),
+            None => Err(ReadVaultFileError::InvalidLengthError()),
+        }
     }
 }
 
@@ -239,13 +287,48 @@ struct DirectoryEntry {
     children: HashMap<String, VaultEntry>,
 }
 
-impl Entry<DirectoryEntry> for DirectoryEntry {
+impl Entry<String> for DirectoryEntry {
     fn display(&self) -> String {
         format!(
             "{} (Dir) {} Items",
             self.directory_name,
             self.children.len()
         )
+    }
+
+    fn retrieve_secret(
+        &self,
+        _reader: &mut BufReader<File>,
+        _data_start: u64,
+        _key: &[u8],
+    ) -> Result<String, ReadVaultFileError> {
+        let mut count = (0, 0, 0);
+        for val in self.children.values() {
+            match val {
+                VaultEntry::Password(_) => count.0 += 1,
+                VaultEntry::Secret(_) => count.1 += 1,
+                VaultEntry::Directory(_) => count.2 += 1,
+            };
+        }
+        Ok(format!(
+            "{}: {} Items ({} Passwords, {} Secrets, {} Directories)",
+            self.directory_name,
+            self.children.len(),
+            count.0,
+            count.1,
+            count.2
+        ))
+    }
+
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
+        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
+        bytes.put_u8(DIRENTRY_TYPE);
+        bytes.put(self.directory_name.as_bytes());
+        bytes.put_u64(self.children.len() as u64);
+        match bytes.as_array::<VAULTENTRY_LENGTH>() {
+            Some(e) => Ok(e.to_owned()),
+            None => Err(ReadVaultFileError::InvalidLengthError()),
+        }
     }
 }
 
@@ -264,7 +347,7 @@ impl Eq for DirectoryEntry {}
 impl DirectoryEntry {
     fn get_sorted_children<'a>(&'a self) -> Vec<&'a VaultEntry> {
         let mut entries: Vec<&'a VaultEntry> = self.children.values().collect();
-        entries.sort_by(|a, b| a.cmp(b));
+        entries.sort();
         entries
     }
 }
@@ -279,11 +362,43 @@ enum VaultEntry {
 }
 
 impl VaultEntry {
+    fn is_directory(&self) => {
+
+    }
+}
+impl Entry<EntryResult> for VaultEntry {
     fn display(&self) -> String {
         match self {
             Self::Password(pwd) => pwd.display(),
             Self::Secret(sec) => sec.display(),
             Self::Directory(dir) => dir.display(),
+        }
+    }
+
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
+        match self {
+            VaultEntry::Password(pwd) => pwd.serialize(),
+            VaultEntry::Secret(sec) => sec.serialize(),
+            VaultEntry::Directory(dir) => dir.serialize(),
+        }
+    }
+
+    fn retrieve_secret(
+        &self,
+        reader: &mut BufReader<File>,
+        data_start: u64,
+        key: &[u8],
+    ) -> Result<EntryResult, ReadVaultFileError> {
+        match self {
+            VaultEntry::Password(pwd) => Ok(EntryResult::Password(
+                pwd.retrieve_secret(reader, data_start, key)?,
+            )),
+            VaultEntry::Secret(sec) => Ok(EntryResult::Secret(
+                sec.retrieve_secret(reader, data_start, key)?,
+            )),
+            VaultEntry::Directory(dir) => Ok(EntryResult::Directory(
+                dir.retrieve_secret(reader, data_start, key)?,
+            )),
         }
     }
 }
@@ -357,7 +472,8 @@ fn read_header(reader: &mut BufReader<File>) -> Result<HeaderInfo, ReadVaultFile
 
     let vaultname_raw = read_field::<VAULTNAME_LENGTH>(reader)
         .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-    let vaultname = String::from_utf8(vaultname_raw.to_vec());
+    let vaultname = String::from_utf8(vaultname_raw.to_vec())
+        .map_err(|e| ReadVaultFileError::ReadError(ReadFieldError::ReadUtf8Error(e), offset))?;
     offset += VAULTNAME_LENGTH as u64;
 
     let userkey_iv =
@@ -537,12 +653,14 @@ fn read_entry(
     match entry_data[0] {
         DIRENTRY_TYPE => {
             // Directory Entry
-            let mut offset = 1;
+            let mut offset: usize = 1;
             let name = String::from_utf8(entry_data[offset..offset + VAULTENTRY_LENGTH].to_vec())
                 .map_err(|e| {
-                ReadVaultFileError::ReadEntryError(ReadFieldError::ReadUtf8Error(e), 1)
+                ReadVaultFileError::ReadEntryError(ReadFieldError::ReadUtf8Error(e), offset as u64)
             })?;
-            offset += VAULTENTRY_LENGTH;
+            offset += VAULTENTRYNAME_LENGTH;
+            // Because array of Copy types are copied when doing a slice this does not consume the
+            // entry_data array
             let size = u64::from_ne_bytes(
                 entry_data[offset..offset + DIRENTRY_SIZE_LENGTH]
                     .try_into()
@@ -558,22 +676,29 @@ fn read_entry(
         }
         PASSWORDENTRY_TYPE => {
             //Password Entry
-            let mut offset = 1;
+            let mut offset: usize = 1;
             let name = String::from_utf8(entry_data[offset..offset + VAULTENTRY_LENGTH].to_vec())
                 .map_err(|e| {
                 ReadVaultFileError::ReadEntryError(ReadFieldError::ReadUtf8Error(e), 1)
             })?;
-            offset += VAULTENTRY_LENGTH;
+            offset += VAULTENTRYNAME_LENGTH;
+            // Because array of Copy types are copied when doing a slice this does not consume the
+            // entry_data array
             let blk_id = u64::from_ne_bytes(
                 entry_data[offset..offset + BLOCKID_LENGTH]
                     .try_into()
                     .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
             );
+            offset += BLOCKID_LENGTH;
+            let nonce: [u8; AES_NONCE_LENGTH] = entry_data[offset..offset + AES_NONCE_LENGTH]
+                .try_into()
+                .map_err(|_| ReadVaultFileError::InvalidLengthError())?;
             Ok((
                 0,
                 VaultEntry::Password(PasswordEntry {
                     password_name: name,
                     secret_block_id: blk_id,
+                    nonce,
                 }),
             ))
         }
@@ -584,24 +709,31 @@ fn read_entry(
                 .map_err(|e| {
                 ReadVaultFileError::ReadEntryError(ReadFieldError::ReadUtf8Error(e), 1)
             })?;
-            offset += VAULTENTRY_LENGTH;
+            offset += VAULTENTRYNAME_LENGTH;
+            // Because array of Copy types are copied when doing a slice this does not consume the
+            // entry_data array
             let blk_id = u64::from_ne_bytes(
                 entry_data[offset..offset + BLOCKID_LENGTH]
                     .try_into()
                     .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
             );
+            offset += BLOCKID_LENGTH;
             let size = u64::from_ne_bytes(
                 entry_data[offset..offset + SECRET_SIZE_LENGTH]
                     .try_into()
                     .map_err(|_| ReadVaultFileError::InvalidLengthError())?,
             );
-
+            offset += SECRET_SIZE_LENGTH;
+            let nonce: [u8; AES_NONCE_LENGTH] = entry_data[offset..offset + AES_NONCE_LENGTH]
+                .try_into()
+                .map_err(|_| ReadVaultFileError::InvalidLengthError())?;
             Ok((
                 0,
                 VaultEntry::Secret(SecretFileEntry {
                     secret_name: name,
                     secret_block_id: blk_id,
                     size,
+                    nonce,
                 }),
             ))
         }
@@ -623,14 +755,17 @@ fn get_user_key(iv: &[u8; IV_LENGTH]) -> Result<[u8; VAULTKEY_LENGTH], std::io::
 /// the is expected to be instantiated on the vault file
 /// `data_blocK-start` is the offset in bytes from file start to target data block start
 /// The key is the AES-GCM key used to decrypt the file
-/// The nonce is read automatically from the data block section
-fn read_data_block(reader: &mut BufReader<File>, data_block_start: u64, key: &[u8]) -> Result<[u8; DATABLOCK_RAW_LENGTH], ReadVaultFileError> {
+/// The nonce is used for AES-GCM encryption
+fn read_data_block(
+    reader: &mut BufReader<File>,
+    data_block_start: u64,
+    key: &[u8],
+    nonce: &[u8; AES_NONCE_LENGTH],
+) -> Result<[u8; DATABLOCK_RAW_LENGTH], ReadVaultFileError> {
     let offset = reader
         .seek(SeekFrom::Start(data_block_start))
         .map_err(|e| ReadVaultFileError::ReadFileError(e))?;
     let enc_data_res = read_field::<DATABLOCK_ENC_LENGTH>(reader)
-        .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
-    let nonce = read_field::<AES_NONCE_LENGTH>(reader)
         .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
     let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
         .map_err(|_| ReadVaultFileError::InAuthenticTagError())?;

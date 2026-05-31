@@ -8,6 +8,7 @@ pub enum CryptographyError {
     }
 }
 
+
 impl fmt::Display for CryptographyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -46,4 +47,6 @@ pub enum ReadFieldError {
 
 pub enum VaultManagementError {
     WriteError,
+    EntryNotFound(String),
+    VaultError(ReadVaultFileError)
 }
