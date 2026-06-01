@@ -5,7 +5,8 @@ use crate::crypt::{
 };
 use crate::error::{InvalidFileReasons, ReadFieldError, ReadVaultFileError, VaultManagementError};
 use std::fmt::Write;
-use std::io::{Seek, SeekFrom};
+use std::io::{BufWriter, Seek, SeekFrom};
+use std::vec::IntoIter;
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
@@ -89,8 +90,10 @@ impl VaultManager {
 
         // Iterate through the directory and gather information
         // Entries are normally not sorted
-        let mut sorted_dir_stack: VecDeque<VecDeque<&VaultEntry>> = VecDeque::new();
-        sorted_dir_stack.push_front(self.root_entry.get_sorted_children().into());
+        let mut sorted_dir_stack: VecDeque<IntoIter<&VaultEntry>> = VecDeque::new();
+        self.root_entry.get_sorted_children();
+        // A consuming Iterator is used which holds the values after sorting
+        sorted_dir_stack.push_front(self.root_entry.get_sorted_children().into_iter());
 
         loop {
             let cur_dir = sorted_dir_stack.front_mut();
@@ -98,18 +101,23 @@ impl VaultManager {
                 //break if there is no more directories -> finished
                 break;
             }
+
             let cur_dir = cur_dir.unwrap();
-            let entry = cur_dir.pop_front();
+            let entry = cur_dir.next();
             // get is_empty earlier due to our usage of sorted_dir_stack alter (borrow-checker issue)
-            let is_empty = cur_dir.is_empty();
+            let is_empty = cur_dir.len() == 0;
             if entry.is_none() {
                 // Directory is finished
                 sorted_dir_stack.pop_front();
             } else {
+                let entry = entry.unwrap();
+                if let VaultEntry::Directory(dir) = entry {
+                    sorted_dir_stack.push_front(dir.get_sorted_children().into_iter());
+                }
                 // build a prefix string to give a pretty view
                 // similar-ish to `pstree`
                 let prefix_str = build_prefix_str(sorted_dir_stack.len() as u64 - 1, is_empty);
-                write!(&mut out, "{} {}", prefix_str, entry.unwrap().display())
+                write!(&mut out, "{} {}", prefix_str, entry.display())
                     .map_err(|_| VaultManagementError::WriteError)?;
             }
         }
@@ -151,13 +159,47 @@ impl VaultManager {
         target_entry.retrieve_secret(&mut reader, self.data_start, &self.vault_key)
             .map_err(|e| VaultManagementError::VaultError(e))
     }
+
+    //TODO: Implement checksum checking for advanced security
+    //TODO: Implement store features
+    
+    pub fn save_vault(&self) -> VaultManagementError {
+        let file = File::open(Path::new(&self.vault_path));
+        let mut writer = BufWriter::new(file);
+
+
+        
+    } 
+
+    /// Returns a list of empty data blocks in the vault archive
+    /// If there are no empty data blocks an empty vector is returned
+    fn get_empty_data_blocks(&self) -> Vec<u64> {
+        let empty_blocks: Vec<u64> = Vec::new();
+
+        let dir_stack: Vec<&DirectoryEntry> = Vec::new();
+        // In this iteration it is irrelevant in what order we consume the entries -> Use the
+        // easiest and lowest space consuming implementation
+        let data_block_ids: Vec<u64> = Vec::new();
+        // TODO: Collect all used block ids by iterating through the vault and then check for empty
+        // spaces. Keep in mind for secret file entries which can take multiple data blocks at once
+        loop {
+            let dir = dir_stack.pop();
+            if dir.is_none() {
+                break ;
+            }
+        }
+        
+    }
 }
+
+/// An Enum representing the result of an entry secret retrieval
 enum EntryResult {
     Password(String),
     Secret(Bytes),
     Directory(String),
 }
 
+/// A trait that defines functions for entries to implement
 trait Entry<T> {
     fn display(&self) -> String;
     fn retrieve_secret(
@@ -168,6 +210,7 @@ trait Entry<T> {
     ) -> Result<T, ReadVaultFileError>;
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError>;
 }
+
 
 /// Header Information of the archive file
 #[derive(Debug)]
@@ -345,10 +388,14 @@ impl PartialEq for DirectoryEntry {
 impl Eq for DirectoryEntry {}
 
 impl DirectoryEntry {
-    fn get_sorted_children<'a>(&'a self) -> Vec<&'a VaultEntry> {
-        let mut entries: Vec<&'a VaultEntry> = self.children.values().collect();
+    fn get_sorted_children(&self) -> Vec<&VaultEntry> {
+        let mut entries: Vec<&VaultEntry> = self.children.values().collect();
         entries.sort();
         entries
+    }
+    
+    fn get_children(&self) -> Vec<&VaultEntry> {
+        self.children.values().collect()
     }
 }
 
@@ -361,11 +408,6 @@ enum VaultEntry {
     Directory(DirectoryEntry),
 }
 
-impl VaultEntry {
-    fn is_directory(&self) => {
-
-    }
-}
 impl Entry<EntryResult> for VaultEntry {
     fn display(&self) -> String {
         match self {
@@ -403,6 +445,14 @@ impl Entry<EntryResult> for VaultEntry {
     }
 }
 
+impl VaultEntry {
+    fn is_directory(&self) -> bool {
+        match &self {
+            VaultEntry::Directory(_) => true,
+            _ => false
+        }
+    } 
+}
 impl PartialOrd for VaultEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
