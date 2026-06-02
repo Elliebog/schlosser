@@ -2,20 +2,18 @@ use core::fmt;
 use std::string::FromUtf8Error;
 pub enum CryptographyError {
     InauthenticTag,
-    InvalidLength{
-        expected: usize,
-        actual: usize,
-    }
+    InvalidLength { expected: usize, actual: usize },
 }
-
 
 impl fmt::Display for CryptographyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InauthenticTag => 
-                write!(f, "Authentication tag corrupted"),
-            Self::InvalidLength { expected, actual } => 
-                write!(f, "Mismatch when converting data: expected {} but got {}", expected, actual)
+            Self::InauthenticTag => write!(f, "Authentication tag corrupted"),
+            Self::InvalidLength { expected, actual } => write!(
+                f,
+                "Mismatch when converting data: expected {} but got {}",
+                expected, actual
+            ),
         }
     }
 }
@@ -48,5 +46,24 @@ pub enum ReadFieldError {
 pub enum VaultManagementError {
     WriteError,
     EntryNotFound(String),
-    VaultError(ReadVaultFileError)
+    VaultError(ReadVaultFileError),
+    InvalidOperation(OperationType, VaultEntryType),
+    InvalidLengthError()
+}
+
+pub enum OperationType {
+    Rename,
+    ChangePassword,
+    ChangeSecret,
+    NewEntry,
+}
+
+pub enum VaultEntryType {
+    Password, 
+    Secret,
+    Directory
+}
+
+pub enum InvalidBlockRegionError {
+    Overlap,
 }

@@ -3,7 +3,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crate::crypt::{
     AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
-use crate::error::{InvalidFileReasons, ReadFieldError, ReadVaultFileError, VaultManagementError};
+use crate::error::{
+    InvalidBlockRegionError, InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError, VaultEntryType, VaultManagementError
+};
+use std::cmp::{Reverse, max};
+use std::collections::BinaryHeap;
 use std::fmt::Write;
 use std::io::{BufWriter, Seek, SeekFrom};
 use std::vec::IntoIter;
@@ -43,8 +47,7 @@ const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + AES_NONCE_LENGTH
     + ENCRYPTED_REGION_LENGTH;
 const DATABLOCK_RAW_LENGTH: usize = 256;
-const DATABLOCK_ENC_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
-const DATABLOCK_LENGTH: usize = DATABLOCK_ENC_LENGTH + AES_NONCE_LENGTH;
+const DATABLOCK_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
 // Vault string constants
 const V_CONNECTOR: &str = "│\t";
 const LITERAL: &str = "├─ ";
@@ -124,16 +127,12 @@ impl VaultManager {
         Ok(out)
     }
 
-    pub fn retrieve_entry(&self, entry_path: String) -> Result<EntryResult, VaultManagementError> {
-        let file = File::open(Path::new(&self.vault_path))
-            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
-        let mut reader = BufReader::new(file);
-
+    fn get_entry(&self, entry_path: &String) -> Result<&VaultEntry, VaultManagementError> {
         // An Entry Path is a string seperated by slashes
         let mut cur_dir: &DirectoryEntry = &self.root_entry;
         let mut path: VecDeque<&str> = entry_path.split('/').collect();
         let mut final_entry: Option<&VaultEntry> = None;
-        let target_entry = loop {
+        loop {
             let name = path.pop_front();
             if name.is_none() {
                 break match final_entry {
@@ -142,54 +141,314 @@ impl VaultManager {
                 };
             }
 
-            //search current directory 
+            //search current directory
             let entry = cur_dir.children.get(name.unwrap());
             if entry.is_none() {
-                break Err(VaultManagementError::EntryNotFound(entry_path.clone()))
+                break Err(VaultManagementError::EntryNotFound(entry_path.clone()));
             }
-            
+
             let entry = entry.unwrap();
             if let VaultEntry::Directory(dir) = entry {
-               cur_dir = dir; 
+                cur_dir = dir;
             }
 
             final_entry = Some(entry);
-        }?;
-        
-        target_entry.retrieve_secret(&mut reader, self.data_start, &self.vault_key)
+        }
+    }
+
+    pub fn retrieve_entry(&self, entry_path: String) -> Result<EntryResult, VaultManagementError> {
+        let file = File::open(Path::new(&self.vault_path))
+            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
+        let mut reader = BufReader::new(file);
+
+        let target_entry = self.get_entry(&entry_path)?;
+        target_entry
+            .retrieve_secret(&mut reader, self.data_start, &self.vault_key)
             .map_err(|e| VaultManagementError::VaultError(e))
     }
 
     //TODO: Implement checksum checking for advanced security
     //TODO: Implement store features
-    
+
+    /// Writes the vault to the vault archive file
     pub fn save_vault(&self) -> VaultManagementError {
-        let file = File::open(Path::new(&self.vault_path));
+        let file = File::open(Path::new(&self.vault_path))
+            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
         let mut writer = BufWriter::new(file);
-
-
-        
-    } 
+    }
 
     /// Returns a list of empty data blocks in the vault archive
     /// If there are no empty data blocks an empty vector is returned
-    fn get_empty_data_blocks(&self) -> Vec<u64> {
-        let empty_blocks: Vec<u64> = Vec::new();
+    fn get_empty_data_blocks(&self) -> Vec<BlockRange> {
+        let mut empty_blocks: Vec<BlockRange> = Vec::new();
 
-        let dir_stack: Vec<&DirectoryEntry> = Vec::new();
+        let mut dir_stack: Vec<&DirectoryEntry> = Vec::new();
         // In this iteration it is irrelevant in what order we consume the entries -> Use the
         // easiest and lowest space consuming implementation
-        let data_block_ids: Vec<u64> = Vec::new();
-        // TODO: Collect all used block ids by iterating through the vault and then check for empty
-        // spaces. Keep in mind for secret file entries which can take multiple data blocks at once
-        loop {
-            let dir = dir_stack.pop();
-            if dir.is_none() {
-                break ;
+        // A Binary Heap is used to sort the collection of block ids to not waste time on later
+        // contains calls in the empty block finding
+        let mut data_block_ids: BinaryHeap<Reverse<u64>> = BinaryHeap::new();
+        while let Some(dir) = dir_stack.pop() {
+            for entry in dir.get_children() {
+                match entry {
+                    VaultEntry::Password(pwd) => data_block_ids.push(Reverse(pwd.secret_block_id)),
+                    VaultEntry::Secret(sec) => {
+                        // Secret entries can take up more than one block
+                        for i in 0..sec.size {
+                            data_block_ids.push(Reverse(sec.secret_block_id + i))
+                        }
+                    }
+                    VaultEntry::Directory(subdir) => dir_stack.push(subdir),
+                };
             }
         }
-        
+
+        // Work with an option to avoid ugly problems with i64 and u64 incompatability
+        let mut last_block_id: Option<u64> = None;
+        while let Some(block_id) = data_block_ids.pop() {
+            let diff = match last_block_id {
+                Some(val) => block_id.0 - (val + 1),
+                None => block_id.0,
+            };
+            if diff > 0 {
+                match last_block_id {
+                    Some(val) => empty_blocks.push(BlockRange::new(val + 1, diff)),
+                    None => empty_blocks.push(BlockRange::new(0, diff)),
+                }
+            }
+            last_block_id = Some(block_id.0);
+        }
+        empty_blocks
     }
+}
+
+
+
+#[derive(PartialEq, Eq, Clone)]
+struct BlockRange {
+    start: u64,
+    len: u64,
+}
+
+impl PartialOrd for BlockRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.start.partial_cmp(&other.start)
+    }
+}
+
+impl Ord for BlockRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start.cmp(&other.start)
+    }
+}
+
+impl BlockRange {
+    fn new(start: u64, len: u64) -> Self {
+        BlockRange { start, len }
+    }
+}
+
+struct VaultChangeBuilder<'a> {
+    empty_blocks: Vec<BlockRange>,
+    changes: Vec<VaultChange>,
+    manager: &'a VaultManager,
+}
+
+impl<'a> VaultChangeBuilder<'a> {
+    pub fn new(manager: &'a VaultManager) -> Self {
+        VaultChangeBuilder {
+            empty_blocks: manager.get_empty_data_blocks(),
+            changes: Vec::new(),
+            manager,
+        }
+    }
+
+    pub fn rename(&mut self, entry_path: String, new_name: String) {
+        self.changes.push(VaultChange::Rename {
+            entry_path,
+            new_name,
+        });
+    }
+
+    pub fn change_password(
+        &mut self,
+        entry_path: String,
+        data: Bytes,
+    ) -> Result<(), VaultManagementError> {
+        let size: usize = data.len() / DATABLOCK_LENGTH;
+        if size > 1 {
+            // data is too big to be a password data block
+            return Err(VaultManagementError::InvalidLengthError());
+        }
+        // Passwords are always edited in place
+        let entry = self.manager.get_entry(&entry_path)?;
+        let block_id = match entry {
+            VaultEntry::Directory(_) => Err(VaultManagementError::InvalidOperation(
+                OperationType::ChangePassword,
+                VaultEntryType::Directory,
+            )),
+            VaultEntry::Secret(_) => Err(VaultManagementError::InvalidOperation(
+                OperationType::ChangePassword,
+                VaultEntryType::Secret,
+            )),
+            VaultEntry::Password(pwd) => Ok(pwd.secret_block_id),
+        }?;
+
+        self.changes.push(VaultChange::ChangePassword {
+            entry_path,
+            change: DataBlockChange::new(block_id, 1, data),
+        });
+        Ok(())
+    }
+
+    pub fn change_secret(
+        &mut self,
+        entry_path: String,
+        data: Bytes,
+    ) -> Result<(), VaultManagementError> {
+        let size: usize = data.len() / DATABLOCK_LENGTH;
+        let entry = self.manager.get_entry(&entry_path)?;
+
+        let cur_block_range = match entry {
+            VaultEntry::Directory(_) => Err(VaultManagementError::InvalidOperation(
+                OperationType::ChangeSecret,
+                VaultEntryType::Directory,
+            )),
+            VaultEntry::Password(_) => Err(VaultManagementError::InvalidOperation(
+                OperationType::ChangeSecret,
+                VaultEntryType::Password,
+            )),
+            VaultEntry::Secret(sec) => Ok(BlockRange::new(sec.secret_block_id, sec.size)),
+        }?;
+
+        let diff: i64 = (cur_block_range.len as i64) - (size as i64);
+        if diff > 0 {
+            // New Size is bigger than old size -> We have to relocate the entire block range
+            // 1. Mark the current block range the secret occupies as empty blocks
+            // 2. Merge the empty Blocks
+            // 3. Search through the Blocks and occupy the next available space
+            self.empty_blocks.push(cur_block_range);
+            self.empty_blocks.sort_by(|a, b| b.cmp(a));
+            merge_blocks(&mut self.empty_blocks);
+
+            for (i, empty_block) in self.empty_blocks.iter().enumerate() {
+                let empty_diff = (cur_block_range.len as i64) - (empty_block.len as i64);
+                if empty_diff > 0 {
+                    //Empty block is longer -> it fits
+                    
+
+                    // this is guaranteed to exist so we can just unwrap
+                    self.empty_blocks.get_mut(i).unwrap();
+                    
+                }
+            }
+        };
+    }
+}
+
+// It is not optimized for speed efficiency as it is primarily used for the EmptyBlock management
+// We just need something that can manage itself and do the necessary merging operations
+// Empty Blocks shouldn't become very big. Should that be the case one day -> Revisit this
+/// A struct for managing a set of BlockRanges
+struct BlockSet {
+    blocks: Vec<BlockRange>   
+}
+
+impl BlockSet {
+    fn new() -> Self {
+        BlockSet { blocks: Vec::new() }
+    }
+    
+    fn put(&mut self, block: BlockRange) -> Result<(), InvalidBlockRegionError> {
+        //TODO: Rewrite this tomorrow based on scribbles
+        // get 1st overlap and combine. Then combine until one interval does no longer overlap 
+        // for i in 0..self.blocks.len() {
+        //     if self.blocks[i].start > block.start {
+        //         // Insert before
+        //         if block.start+block.len > self.blocks[i].start {
+        //             self.blocks[i].start = block.start;
+        //             let end = max(self.blocks[i].start + self.blocks[i].len, block.start + block.len);
+        //             self.blocks[i].len = 
+        //         } else if block.start+block.len == self.blocks[i].start {
+        //             //needs to merge
+        //             self.blocks[i].start = block.start;
+        //             self.blocks[i].len = block.len + self.blocks[i].len;
+        //         }
+        //     }
+        // };
+    }
+}
+
+impl From<Vec<BlockRange>> for BlockSet {
+    fn from(value: Vec<BlockRange>) -> Self {
+        BlockSet { blocks: value }
+    }
+}
+
+/// Merges Block Ranges that can be merged. Expects the vector to already be sorted ascending
+/// returns the merged vec
+fn merge_blocks(empty_blocks: &mut Vec<BlockRange>) {
+    let mut curr_index: usize = 0;
+    loop {
+        //Check if next position is at the end of current block region
+        let block = match empty_blocks.get(curr_index) {
+            Some(blk) => blk,
+            None => break,
+        };
+        let next_block = match empty_blocks.get(curr_index + 1) {
+            Some(blk) => blk,
+            None => break,
+        }
+        .clone();
+        if next_block.start == block.start + block.len {
+            // We need to merge
+            let block_mut = match empty_blocks.get_mut(curr_index) {
+                Some(blk) => blk,
+                None => break,
+            };
+
+            block_mut.len += next_block.len;
+            empty_blocks.remove(curr_index + 1);
+        } else {
+            curr_index += 1;
+        }
+    }
+}
+
+
+
+struct DataBlockChange {
+    start: u64,
+    len: usize,
+    data: Bytes,
+}
+
+impl DataBlockChange {
+    fn new(start: u64, len: usize, data: Bytes) -> Self {
+        DataBlockChange { start, len, data }
+    }
+}
+
+enum VaultChange {
+    Rename {
+        entry_path: String,
+        new_name: String,
+    },
+    ChangePassword {
+        entry_path: String,
+        change: DataBlockChange,
+    },
+    ChangeSecret {
+        entry_path: String,
+        change: DataBlockChange,
+    },
+    NewDir {
+        entry_path: String,
+    },
+    NewEntry {
+        entry_path: String,
+        change: DataBlockChange,
+    },
 }
 
 /// An Enum representing the result of an entry secret retrieval
@@ -210,7 +469,6 @@ trait Entry<T> {
     ) -> Result<T, ReadVaultFileError>;
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError>;
 }
-
 
 /// Header Information of the archive file
 #[derive(Debug)]
@@ -393,7 +651,7 @@ impl DirectoryEntry {
         entries.sort();
         entries
     }
-    
+
     fn get_children(&self) -> Vec<&VaultEntry> {
         self.children.values().collect()
     }
@@ -449,9 +707,9 @@ impl VaultEntry {
     fn is_directory(&self) -> bool {
         match &self {
             VaultEntry::Directory(_) => true,
-            _ => false
+            _ => false,
         }
-    } 
+    }
 }
 impl PartialOrd for VaultEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -815,7 +1073,7 @@ fn read_data_block(
     let offset = reader
         .seek(SeekFrom::Start(data_block_start))
         .map_err(|e| ReadVaultFileError::ReadFileError(e))?;
-    let enc_data_res = read_field::<DATABLOCK_ENC_LENGTH>(reader)
+    let enc_data_res = read_field::<DATABLOCK_LENGTH>(reader)
         .map_err(|e| ReadVaultFileError::ReadError(e, offset))?;
     let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
         .map_err(|_| ReadVaultFileError::InAuthenticTagError())?;
