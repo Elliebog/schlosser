@@ -4,8 +4,10 @@ use crate::crypt::{
     AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
 use crate::error::{
-    InvalidBlockRegionError, InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError, VaultEntryType, VaultManagementError
+    InvalidBlockRegionError, InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError,
+    VaultEntryType, VaultManagementError,
 };
+use core::f32::math;
 use std::cmp::{Reverse, max};
 use std::collections::BinaryHeap;
 use std::fmt::Write;
@@ -179,7 +181,7 @@ impl VaultManager {
 
     /// Returns a list of empty data blocks in the vault archive
     /// If there are no empty data blocks an empty vector is returned
-    fn get_empty_data_blocks(&self) -> Vec<BlockRange> {
+    fn get_empty_data_blocks(&self) -> BlockSet {
         let mut empty_blocks: Vec<BlockRange> = Vec::new();
 
         let mut dir_stack: Vec<&DirectoryEntry> = Vec::new();
@@ -212,44 +214,49 @@ impl VaultManager {
             };
             if diff > 0 {
                 match last_block_id {
-                    Some(val) => empty_blocks.push(BlockRange::new(val + 1, diff)),
-                    None => empty_blocks.push(BlockRange::new(0, diff)),
+                    Some(val) => empty_blocks.push(BlockRange::new(val + 1, diff as usize)),
+                    None => empty_blocks.push(BlockRange::new(0, diff as usize)),
                 }
             }
             last_block_id = Some(block_id.0);
         }
-        empty_blocks
+        BlockSet::from(empty_blocks)
     }
 }
 
-
-
-#[derive(PartialEq, Eq, Clone)]
-struct BlockRange {
-    start: u64,
-    len: u64,
-}
-
-impl PartialOrd for BlockRange {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.start.partial_cmp(&other.start)
-    }
-}
-
-impl Ord for BlockRange {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start.cmp(&other.start)
-    }
-}
-
-impl BlockRange {
-    fn new(start: u64, len: u64) -> Self {
-        BlockRange { start, len }
-    }
+enum VaultChange {
+    Rename {
+        entry_path: String,
+        new_name: String,
+    },
+    ChangePassword {
+        entry_path: String,
+        change: DataBlockChange,
+    },
+    ChangeSecret {
+        entry_path: String,
+        entry_new_size: usize,
+        change: DataBlockChange,
+    },
+    NewDir {
+        entry_path: String,
+    },
+    NewPassword {
+        entry_path: String,
+        change: DataBlockChange,
+    },
+    NewSecret {
+        entry_path: String,
+        change: DataBlockChange
+    },
+    DeleteEntry {
+        entry_path: String,
+        change: DataBlockChange,
+    },
 }
 
 struct VaultChangeBuilder<'a> {
-    empty_blocks: Vec<BlockRange>,
+    empty_blocks: BlockSet,
     changes: Vec<VaultChange>,
     manager: &'a VaultManager,
 }
@@ -318,31 +325,91 @@ impl<'a> VaultChangeBuilder<'a> {
                 OperationType::ChangeSecret,
                 VaultEntryType::Password,
             )),
-            VaultEntry::Secret(sec) => Ok(BlockRange::new(sec.secret_block_id, sec.size)),
+            VaultEntry::Secret(sec) => Ok(BlockRange::new(sec.secret_block_id, sec.size as usize)),
         }?;
 
-        let diff: i64 = (cur_block_range.len as i64) - (size as i64);
-        if diff > 0 {
+        let diff: i64 = (cur_block_range.len() as i64) - (size as i64);
+        let change = if diff < 0 {
             // New Size is bigger than old size -> We have to relocate the entire block range
             // 1. Mark the current block range the secret occupies as empty blocks
-            // 2. Merge the empty Blocks
-            // 3. Search through the Blocks and occupy the next available space
-            self.empty_blocks.push(cur_block_range);
-            self.empty_blocks.sort_by(|a, b| b.cmp(a));
-            merge_blocks(&mut self.empty_blocks);
-
-            for (i, empty_block) in self.empty_blocks.iter().enumerate() {
-                let empty_diff = (cur_block_range.len as i64) - (empty_block.len as i64);
-                if empty_diff > 0 {
-                    //Empty block is longer -> it fits
-                    
-
-                    // this is guaranteed to exist so we can just unwrap
-                    self.empty_blocks.get_mut(i).unwrap();
-                    
-                }
+            // 2. Search through the Blocks and occupy the next available space
+            self.empty_blocks.put(cur_block_range);
+            let new_range = self.empty_blocks.occupy(size);
+            VaultChange::ChangeSecret {
+                entry_path,
+                change: DataBlockChange::new(new_range.start, new_range.len(), data),
+                entry_new_size: new_range.len()
+            }
+        } else if diff == 0 {
+            VaultChange::ChangeSecret {
+                entry_path,
+                change: DataBlockChange::new(cur_block_range.start, size, data),
+                entry_new_size: size,
+            }
+        } else {
+            self.empty_blocks
+                .put(BlockRange::new(cur_block_range.end + 1, diff as usize));
+            // Modify DataBlockChange to also erase the old data
+            let mut block_data = BytesMut::zeroed(cur_block_range.len() * DATABLOCK_LENGTH); 
+            block_data.put(data);
+            VaultChange::ChangeSecret {
+                entry_path,
+                change: DataBlockChange {
+                    start: cur_block_range.start,
+                    len: cur_block_range.len(),
+                    data: block_data.freeze(),
+                },
+                entry_new_size: size,
             }
         };
+        self.changes.push(change);
+        Ok(())
+    }
+
+    pub fn new_dir(&mut self, dir_path: String) {
+        self.changes.push(VaultChange::NewDir { entry_path: dir_path });
+    }
+}
+
+#[derive(PartialEq, Eq, Clone)]
+struct BlockRange {
+    start: u64,
+    end: u64,
+}
+
+impl PartialOrd for BlockRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.start.partial_cmp(&other.start)
+    }
+}
+
+impl Ord for BlockRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start.cmp(&other.start)
+    }
+}
+
+impl BlockRange {
+    fn new(start: u64, len: usize) -> Self {
+        BlockRange {
+            start,
+            end: start - 1 + (len as u64),
+        }
+    }
+
+    fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+
+    fn merge_block(&self, other: &Self) -> Self {
+        BlockRange {
+            start: std::cmp::min(self.start, other.start),
+            end: std::cmp::max(self.end, other.end),
+        }
     }
 }
 
@@ -351,31 +418,74 @@ impl<'a> VaultChangeBuilder<'a> {
 // Empty Blocks shouldn't become very big. Should that be the case one day -> Revisit this
 /// A struct for managing a set of BlockRanges
 struct BlockSet {
-    blocks: Vec<BlockRange>   
+    blocks: Vec<BlockRange>,
 }
 
 impl BlockSet {
     fn new() -> Self {
         BlockSet { blocks: Vec::new() }
     }
-    
-    fn put(&mut self, block: BlockRange) -> Result<(), InvalidBlockRegionError> {
-        //TODO: Rewrite this tomorrow based on scribbles
-        // get 1st overlap and combine. Then combine until one interval does no longer overlap 
-        // for i in 0..self.blocks.len() {
-        //     if self.blocks[i].start > block.start {
-        //         // Insert before
-        //         if block.start+block.len > self.blocks[i].start {
-        //             self.blocks[i].start = block.start;
-        //             let end = max(self.blocks[i].start + self.blocks[i].len, block.start + block.len);
-        //             self.blocks[i].len = 
-        //         } else if block.start+block.len == self.blocks[i].start {
-        //             //needs to merge
-        //             self.blocks[i].start = block.start;
-        //             self.blocks[i].len = block.len + self.blocks[i].len;
-        //         }
-        //     }
-        // };
+
+    /// Put a new BlockRange into the Blockset and merge blocks if they overlap
+    fn put(&mut self, block: BlockRange) {
+        // get 1st overlap and combine. Then combine until one interval does no longer overlap
+        let mut i: usize = 0;
+        let mut check_overlap = false;
+        loop {
+            if i >= self.blocks.len() {
+                // Block needs to be appended at end
+                // This needs to be a clone because of the borrow checker
+                self.blocks.push(block.clone());
+                break;
+            }
+            if check_overlap {
+                //Check if the next block region overlaps with the newly created one
+                if !self.blocks[i].overlaps(&self.blocks[i + 1]) {
+                    break;
+                }
+                // we need to merge again
+                let next_block = self.blocks.remove(i + 1);
+                self.blocks[i] = self.blocks[i].merge_block(&next_block);
+                // avoid increment
+                continue;
+            }
+            if self.blocks[i].overlaps(&block) {
+                self.blocks[i] = block.merge_block(&self.blocks[i]);
+                check_overlap = true;
+                // Continue to avoid i increment
+                continue;
+            } else if block.start < self.blocks[i].start {
+                // No overlaps -> just insert
+                self.blocks.insert(i, block);
+                break;
+            }
+            i += 1;
+        }
+    }
+    /// Finds an empty slot where a BlockRange can be inserted. It automatically marks the returned
+    /// slot to be filled and removes it from its internal empty blocks
+    fn occupy(&mut self, req_block_size: usize) -> BlockRange {
+        let mut target_index = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if block.len() >= req_block_size {
+                target_index = Some(i);
+                break;
+            }
+        }
+        match target_index {
+            None => BlockRange::new(self.blocks[self.blocks.len() - 1].end + 1, req_block_size),
+            Some(i) => {
+                let start = self.blocks[i].start;
+                let len = self.blocks[i].len();
+                if len > req_block_size {
+                    self.blocks[i].start = start + req_block_size as u64;
+                    self.blocks[i].end = (len - req_block_size) as u64;
+                } else {
+                    self.blocks.remove(i);
+                }
+                BlockRange::new(start, req_block_size)
+            }
+        }
     }
 }
 
@@ -385,37 +495,35 @@ impl From<Vec<BlockRange>> for BlockSet {
     }
 }
 
-/// Merges Block Ranges that can be merged. Expects the vector to already be sorted ascending
-/// returns the merged vec
-fn merge_blocks(empty_blocks: &mut Vec<BlockRange>) {
-    let mut curr_index: usize = 0;
-    loop {
-        //Check if next position is at the end of current block region
-        let block = match empty_blocks.get(curr_index) {
-            Some(blk) => blk,
-            None => break,
-        };
-        let next_block = match empty_blocks.get(curr_index + 1) {
-            Some(blk) => blk,
-            None => break,
-        }
-        .clone();
-        if next_block.start == block.start + block.len {
-            // We need to merge
-            let block_mut = match empty_blocks.get_mut(curr_index) {
-                Some(blk) => blk,
-                None => break,
-            };
-
-            block_mut.len += next_block.len;
-            empty_blocks.remove(curr_index + 1);
-        } else {
-            curr_index += 1;
-        }
-    }
-}
-
-
+// /// Merges Block Ranges that can be merged. Expects the vector to already be sorted ascending
+// /// returns the merged vec
+// fn merge_blocks(empty_blocks: &mut Vec<BlockRange>) {
+//     let mut curr_index: usize = 0;
+//     loop {
+//         //Check if next position is at the end of current block region
+//         let block = match empty_blocks.get(curr_index) {
+//             Some(blk) => blk,
+//             None => break,
+//         };
+//         let next_block = match empty_blocks.get(curr_index + 1) {
+//             Some(blk) => blk,
+//             None => break,
+//         }
+//         .clone();
+//         if next_block.start == block.start + block.len {
+//             // We need to merge
+//             let block_mut = match empty_blocks.get_mut(curr_index) {
+//                 Some(blk) => blk,
+//                 None => break,
+//             };
+//
+//             block_mut.len += next_block.len;
+//             empty_blocks.remove(curr_index + 1);
+//         } else {
+//             curr_index += 1;
+//         }
+//     }
+// }
 
 struct DataBlockChange {
     start: u64,
@@ -427,28 +535,6 @@ impl DataBlockChange {
     fn new(start: u64, len: usize, data: Bytes) -> Self {
         DataBlockChange { start, len, data }
     }
-}
-
-enum VaultChange {
-    Rename {
-        entry_path: String,
-        new_name: String,
-    },
-    ChangePassword {
-        entry_path: String,
-        change: DataBlockChange,
-    },
-    ChangeSecret {
-        entry_path: String,
-        change: DataBlockChange,
-    },
-    NewDir {
-        entry_path: String,
-    },
-    NewEntry {
-        entry_path: String,
-        change: DataBlockChange,
-    },
 }
 
 /// An Enum representing the result of an entry secret retrieval
