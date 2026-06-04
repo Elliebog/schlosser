@@ -43,12 +43,27 @@ pub enum ReadFieldError {
     UnexpectedEOFError(),
 }
 
-pub enum VaultManagementError {
+pub enum VaultError {
     WriteError,
+    WriteStdoutError,
     EntryNotFound(String),
-    VaultError(ReadVaultFileError),
+    ReadVaultError(ReadVaultFileError),
     InvalidOperation(OperationType, VaultEntryType),
-    InvalidLengthError()
+    InvalidLengthError(),
+    DuplicateEntryError(String),
+    CryptographyError(CryptographyError)
+}
+
+impl From<CryptographyError> for VaultError {
+    fn from(value: CryptographyError) -> Self {
+        VaultError::CryptographyError(value)
+    }
+}
+
+impl From<ReadVaultFileError> for VaultError {
+    fn from(value: ReadVaultFileError) -> Self {
+        VaultError::ReadVaultError(value)
+    }
 }
 
 pub enum OperationType {
@@ -56,6 +71,7 @@ pub enum OperationType {
     ChangePassword,
     ChangeSecret,
     NewEntry,
+    RetrieveSecret,
 }
 
 pub enum VaultEntryType {

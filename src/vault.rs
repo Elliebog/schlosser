@@ -1,14 +1,14 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::crypt::{
-    AES_NONCE_LENGTH, IV_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
+    AES_NONCE_LENGTH, EncryptedData, IV_LENGTH, decrypt_region, decrypt_region_dyn, encrypt_region,
+    generate_user_key,
 };
 use crate::error::{
-    InvalidBlockRegionError, InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError,
-    VaultEntryType, VaultManagementError,
+    InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError, VaultEntryType,
+    VaultError,
 };
-use core::f32::math;
-use std::cmp::{Reverse, max};
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write;
 use std::io::{BufWriter, Seek, SeekFrom};
@@ -70,6 +70,11 @@ struct VaultManager {
     root_entry: DirectoryEntry,
     /// The path to the archive file
     vault_path: String,
+    /// A buffer that holds all planned data block changes
+    buffered_changes: Vec<DataBlockChange>,
+    /// A collection for internal purposes that tracks the empty blocks inside a vault archive.
+    /// An Option as it is initialized only when needed in vault modification operations
+    empty_blocks: Option<BlockSet>,
 }
 
 impl VaultManager {
@@ -87,12 +92,15 @@ impl VaultManager {
                 + HEADER_LENGTH as u64,
             root_entry,
             vault_path: file_path.to_owned(),
+            buffered_changes: Vec::new(),
+            empty_blocks: None,
         })
     }
 
-    pub fn get_vault_info(&self) -> Result<String, VaultManagementError> {
+    pub fn get_vault_info(&self) -> Result<String, VaultError> {
         let mut out: String = format!("{} Archive", self.name);
 
+        // Use the DirectoryEntry Iterator for easy traversal
         // Iterate through the directory and gather information
         // Entries are normally not sorted
         let mut sorted_dir_stack: VecDeque<IntoIter<&VaultEntry>> = VecDeque::new();
@@ -123,59 +131,30 @@ impl VaultManager {
                 // similar-ish to `pstree`
                 let prefix_str = build_prefix_str(sorted_dir_stack.len() as u64 - 1, is_empty);
                 write!(&mut out, "{} {}", prefix_str, entry.display())
-                    .map_err(|_| VaultManagementError::WriteError)?;
+                    .map_err(|_| VaultError::WriteError)?;
             }
         }
         Ok(out)
     }
 
-    fn get_entry(&self, entry_path: &String) -> Result<&VaultEntry, VaultManagementError> {
-        // An Entry Path is a string seperated by slashes
-        let mut cur_dir: &DirectoryEntry = &self.root_entry;
-        let mut path: VecDeque<&str> = entry_path.split('/').collect();
-        let mut final_entry: Option<&VaultEntry> = None;
-        loop {
-            let name = path.pop_front();
-            if name.is_none() {
-                break match final_entry {
-                    None => Err(VaultManagementError::EntryNotFound(entry_path.clone())),
-                    Some(e) => Ok(e),
-                };
-            }
-
-            //search current directory
-            let entry = cur_dir.children.get(name.unwrap());
-            if entry.is_none() {
-                break Err(VaultManagementError::EntryNotFound(entry_path.clone()));
-            }
-
-            let entry = entry.unwrap();
-            if let VaultEntry::Directory(dir) = entry {
-                cur_dir = dir;
-            }
-
-            final_entry = Some(entry);
-        }
-    }
-
-    pub fn retrieve_entry(&self, entry_path: String) -> Result<EntryResult, VaultManagementError> {
+    pub fn retrieve_entry(&self, entry_path: String) -> Result<EntryResult, VaultError> {
         let file = File::open(Path::new(&self.vault_path))
-            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
+            .map_err(|e| VaultError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
         let mut reader = BufReader::new(file);
 
         let target_entry = self.get_entry(&entry_path)?;
         target_entry
             .retrieve_secret(&mut reader, self.data_start, &self.vault_key)
-            .map_err(|e| VaultManagementError::VaultError(e))
+            .map_err(|e| VaultError::VaultError(e))
     }
 
     //TODO: Implement checksum checking for advanced security
     //TODO: Implement store features
 
     /// Writes the vault to the vault archive file
-    pub fn save_vault(&self) -> VaultManagementError {
+    pub fn save_vault(&self) -> VaultError {
         let file = File::open(Path::new(&self.vault_path))
-            .map_err(|e| VaultManagementError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
+            .map_err(|e| VaultError::VaultError(ReadVaultFileError::ReadFileError(e)))?;
         let mut writer = BufWriter::new(file);
     }
 
@@ -222,156 +201,113 @@ impl VaultManager {
         }
         BlockSet::from(empty_blocks)
     }
-}
 
-enum VaultChange {
-    Rename {
-        entry_path: String,
-        new_name: String,
-    },
-    ChangePassword {
-        entry_path: String,
-        change: DataBlockChange,
-    },
-    ChangeSecret {
-        entry_path: String,
-        entry_new_size: usize,
-        change: DataBlockChange,
-    },
-    NewDir {
-        entry_path: String,
-    },
-    NewPassword {
-        entry_path: String,
-        change: DataBlockChange,
-    },
-    NewSecret {
-        entry_path: String,
-        change: DataBlockChange
-    },
-    DeleteEntry {
-        entry_path: String,
-        change: DataBlockChange,
-    },
-}
-
-struct VaultChangeBuilder<'a> {
-    empty_blocks: BlockSet,
-    changes: Vec<VaultChange>,
-    manager: &'a VaultManager,
-}
-
-impl<'a> VaultChangeBuilder<'a> {
-    pub fn new(manager: &'a VaultManager) -> Self {
-        VaultChangeBuilder {
-            empty_blocks: manager.get_empty_data_blocks(),
-            changes: Vec::new(),
-            manager,
-        }
-    }
-
-    pub fn rename(&mut self, entry_path: String, new_name: String) {
-        self.changes.push(VaultChange::Rename {
-            entry_path,
-            new_name,
-        });
+    pub fn rename(&mut self, entry_path: String, new_name: String) -> Result<(), VaultError> {
+        let path: VecDeque<&str> = entry_path.split('/').collect();
+        self.root_entry.rename_entry(path, &entry_path, new_name);
+        Ok(())
     }
 
     pub fn change_password(
         &mut self,
         entry_path: String,
-        data: Bytes,
-    ) -> Result<(), VaultManagementError> {
-        let size: usize = data.len() / DATABLOCK_LENGTH;
-        if size > 1 {
-            // data is too big to be a password data block
-            return Err(VaultManagementError::InvalidLengthError());
-        }
-        // Passwords are always edited in place
-        let entry = self.manager.get_entry(&entry_path)?;
-        let block_id = match entry {
-            VaultEntry::Directory(_) => Err(VaultManagementError::InvalidOperation(
-                OperationType::ChangePassword,
-                VaultEntryType::Directory,
-            )),
-            VaultEntry::Secret(_) => Err(VaultManagementError::InvalidOperation(
-                OperationType::ChangePassword,
-                VaultEntryType::Secret,
-            )),
-            VaultEntry::Password(pwd) => Ok(pwd.secret_block_id),
-        }?;
-
-        self.changes.push(VaultChange::ChangePassword {
-            entry_path,
-            change: DataBlockChange::new(block_id, 1, data),
-        });
-        Ok(())
-    }
-
-    pub fn change_secret(
-        &mut self,
-        entry_path: String,
-        data: Bytes,
-    ) -> Result<(), VaultManagementError> {
-        let size: usize = data.len() / DATABLOCK_LENGTH;
-        let entry = self.manager.get_entry(&entry_path)?;
-
-        let cur_block_range = match entry {
-            VaultEntry::Directory(_) => Err(VaultManagementError::InvalidOperation(
-                OperationType::ChangeSecret,
-                VaultEntryType::Directory,
-            )),
-            VaultEntry::Password(_) => Err(VaultManagementError::InvalidOperation(
-                OperationType::ChangeSecret,
-                VaultEntryType::Password,
-            )),
-            VaultEntry::Secret(sec) => Ok(BlockRange::new(sec.secret_block_id, sec.size as usize)),
-        }?;
-
-        let diff: i64 = (cur_block_range.len() as i64) - (size as i64);
-        let change = if diff < 0 {
-            // New Size is bigger than old size -> We have to relocate the entire block range
-            // 1. Mark the current block range the secret occupies as empty blocks
-            // 2. Search through the Blocks and occupy the next available space
-            self.empty_blocks.put(cur_block_range);
-            let new_range = self.empty_blocks.occupy(size);
-            VaultChange::ChangeSecret {
-                entry_path,
-                change: DataBlockChange::new(new_range.start, new_range.len(), data),
-                entry_new_size: new_range.len()
-            }
-        } else if diff == 0 {
-            VaultChange::ChangeSecret {
-                entry_path,
-                change: DataBlockChange::new(cur_block_range.start, size, data),
-                entry_new_size: size,
-            }
-        } else {
-            self.empty_blocks
-                .put(BlockRange::new(cur_block_range.end + 1, diff as usize));
-            // Modify DataBlockChange to also erase the old data
-            let mut block_data = BytesMut::zeroed(cur_block_range.len() * DATABLOCK_LENGTH); 
-            block_data.put(data);
-            VaultChange::ChangeSecret {
-                entry_path,
-                change: DataBlockChange {
-                    start: cur_block_range.start,
-                    len: cur_block_range.len(),
-                    data: block_data.freeze(),
-                },
-                entry_new_size: size,
-            }
+        password: String,
+    ) -> Result<(), VaultError> {
+        if self.empty_blocks.is_none() {
+            self.empty_blocks = Some(self.get_empty_data_blocks())
         };
-        self.changes.push(change);
-        Ok(())
-    }
 
-    pub fn new_dir(&mut self, dir_path: String) {
-        self.changes.push(VaultChange::NewDir { entry_path: dir_path });
+        //encrypt data and add to changes
+        let mut raw_data: BytesMut = BytesMut::zeroed(DATABLOCK_RAW_LENGTH);
+        raw_data.put(password.as_bytes());
+        let data: EncryptedData<DATABLOCK_LENGTH> = encrypt_region(
+            raw_data
+                .freeze()
+                .as_array::<DATABLOCK_RAW_LENGTH>()
+                .unwrap(),
+            &self.vault_key,
+        )?;
+        let path = entry_path.split('/').collect();
+        let entry = self.root_entry.get_entry_mut(path, &entry_path)?;
+        if let VaultEntry::Password(pwd) = entry {
+            self.buffered_changes.push(DataBlockChange::new(
+                pwd.secret_block_id,
+                1,
+                Bytes::copy_from_slice(&data.data[..]),
+            ));
+            Ok(())
+        } else if let VaultEntry::Directory(_) = entry {
+            Err(VaultError::InvalidOperation(OperationType::ChangePassword, VaultEntryType::Directory))
+        } else {
+            Err(VaultError::InvalidOperation(OperationType::ChangePassword, VaultEntryType::Secret))
+        }
+        //TODO: Decide if we should refactor cryptography lib to use Bytes
     }
 }
 
-#[derive(PartialEq, Eq, Clone)]
+// pub fn change_secret(
+//     &mut self,
+//     entry_path: String,
+//     data: Bytes,
+// ) -> Result<(), VaultError> {
+//     let size: usize = data.len() / DATABLOCK_LENGTH;
+//     let entry = self.manager.get_entry(&entry_path)?;
+//
+//     let cur_block_range = match entry {
+//         VaultEntry::Directory(_) => Err( VaultError::InvalidOperation(
+//             OperationType::ChangeSecret,
+//             VaultEntryType::Directory,
+//         )),
+//         VaultEntry::Password(_) => Err( VaultError::InvalidOperation(
+//             OperationType::ChangeSecret,
+//             VaultEntryType::Password,
+//         )),
+//         VaultEntry::Secret(sec) => Ok(BlockRange::new(sec.secret_block_id, sec.size as usize)),
+//     }?;
+//
+//     let diff: i64 = (cur_block_range.len() as i64) - (size as i64);
+//     let change = if diff < 0 {
+//         // New Size is bigger than old size -> We have to relocate the entire block range
+//         // 1. Mark the current block range the secret occupies as empty blocks
+//         // 2. Search through the Blocks and occupy the next available space
+//         self.empty_blocks.put(cur_block_range);
+//         let new_range = self.empty_blocks.occupy(size);
+//         VaultChange::ChangeSecret {
+//             entry_path,
+//             change: DataBlockChange::new(new_range.start, new_range.len(), data),
+//             entry_new_size: new_range.len()
+//         }
+//     } else if diff == 0 {
+//         VaultChange::ChangeSecret {
+//             entry_path,
+//             change: DataBlockChange::new(cur_block_range.start, size, data),
+//             entry_new_size: size,
+//         }
+//     } else {
+//         self.empty_blocks
+//             .put(BlockRange::new(cur_block_range.end + 1, diff as usize));
+//         // Modify DataBlockChange to also erase the old data
+//         let mut block_data = BytesMut::zeroed(cur_block_range.len() * DATABLOCK_LENGTH);
+//         block_data.put(data);
+//         VaultChange::ChangeSecret {
+//             entry_path,
+//             change: DataBlockChange {
+//                 start: cur_block_range.start,
+//                 len: cur_block_range.len(),
+//                 data: block_data.freeze(),
+//             },
+//             entry_new_size: size,
+//         }
+//     };
+//     self.changes.push(change);
+//     Ok(())
+// }
+//
+// pub fn new_dir(&mut self, dir_path: String) {
+//     self.changes.push(VaultChange::NewDir { entry_path: dir_path });
+// }
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct BlockRange {
     start: u64,
     end: u64,
@@ -417,6 +353,7 @@ impl BlockRange {
 // We just need something that can manage itself and do the necessary merging operations
 // Empty Blocks shouldn't become very big. Should that be the case one day -> Revisit this
 /// A struct for managing a set of BlockRanges
+#[derive(Debug)]
 struct BlockSet {
     blocks: Vec<BlockRange>,
 }
@@ -525,6 +462,7 @@ impl From<Vec<BlockRange>> for BlockSet {
 //     }
 // }
 
+#[derive(Debug)]
 struct DataBlockChange {
     start: u64,
     len: usize,
@@ -544,16 +482,26 @@ enum EntryResult {
     Directory(String),
 }
 
-/// A trait that defines functions for entries to implement
-trait Entry<T> {
-    fn display(&self) -> String;
+/// A trait that defines functions for entries that contain secrets to implement.
+/// This trait is not used dynamically for references in Vaultentries but rather just gives a
+/// baseline of functions for entries to implement
+/// In the future this trait and VaultEntry may need to be refactored if a lot of new types need to
+/// be added
+trait EncryptedEntry<T> {
     fn retrieve_secret(
         &self,
         reader: &mut BufReader<File>,
         data_start: u64,
         key: &[u8],
     ) -> Result<T, ReadVaultFileError>;
+}
+
+/// Basic trait that every trait should implement
+/// The same caveats as for `EncryptedEntry<T>` trait apply
+trait Entry {
+    fn display(&self) -> String;
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError>;
+    fn rename(&mut self, new_name: String);
 }
 
 /// Header Information of the archive file
@@ -582,11 +530,7 @@ struct PasswordEntry {
     nonce: [u8; AES_NONCE_LENGTH],
 }
 
-impl Entry<String> for PasswordEntry {
-    fn display(&self) -> String {
-        format!("{} (Password)", self.password_name)
-    }
-
+impl EncryptedEntry<String> for PasswordEntry {
     fn retrieve_secret(
         &self,
         reader: &mut BufReader<File>,
@@ -601,6 +545,12 @@ impl Entry<String> for PasswordEntry {
         String::from_utf8(data.to_vec())
             .map_err(|e| ReadVaultFileError::ReadError(ReadFieldError::ReadUtf8Error(e), 0))
     }
+}
+
+impl Entry for PasswordEntry {
+    fn display(&self) -> String {
+        format!("{} (Password)", self.password_name)
+    }
 
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
         let mut entry = BytesMut::zeroed(VAULTENTRY_LENGTH);
@@ -612,6 +562,10 @@ impl Entry<String> for PasswordEntry {
             Some(e) => Ok(e.to_owned()),
             None => Err(ReadVaultFileError::InvalidLengthError()),
         }
+    }
+
+    fn rename(&mut self, new_name: String) {
+        self.password_name = new_name;
     }
 }
 
@@ -629,11 +583,7 @@ struct SecretFileEntry {
     nonce: [u8; AES_NONCE_LENGTH],
 }
 
-impl Entry<Bytes> for SecretFileEntry {
-    fn display(&self) -> String {
-        format!("{} (File)", self.secret_name)
-    }
-
+impl EncryptedEntry<Bytes> for SecretFileEntry {
     fn retrieve_secret(
         &self,
         reader: &mut BufReader<File>,
@@ -649,6 +599,12 @@ impl Entry<Bytes> for SecretFileEntry {
 
         Ok(bytes.freeze())
     }
+}
+
+impl Entry for SecretFileEntry {
+    fn display(&self) -> String {
+        format!("{} (File)", self.secret_name)
+    }
 
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
         let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
@@ -662,6 +618,10 @@ impl Entry<Bytes> for SecretFileEntry {
             None => Err(ReadVaultFileError::InvalidLengthError()),
         }
     }
+
+    fn rename(&mut self, new_name: String) {
+        self.secret_name = new_name;
+    }
 }
 
 /// Entry that represents a directory in the vault structure
@@ -672,51 +632,6 @@ struct DirectoryEntry {
     /// Entries that are in the directory. A Hashmap is used to facilitate faster password and
     /// secret lookups
     children: HashMap<String, VaultEntry>,
-}
-
-impl Entry<String> for DirectoryEntry {
-    fn display(&self) -> String {
-        format!(
-            "{} (Dir) {} Items",
-            self.directory_name,
-            self.children.len()
-        )
-    }
-
-    fn retrieve_secret(
-        &self,
-        _reader: &mut BufReader<File>,
-        _data_start: u64,
-        _key: &[u8],
-    ) -> Result<String, ReadVaultFileError> {
-        let mut count = (0, 0, 0);
-        for val in self.children.values() {
-            match val {
-                VaultEntry::Password(_) => count.0 += 1,
-                VaultEntry::Secret(_) => count.1 += 1,
-                VaultEntry::Directory(_) => count.2 += 1,
-            };
-        }
-        Ok(format!(
-            "{}: {} Items ({} Passwords, {} Secrets, {} Directories)",
-            self.directory_name,
-            self.children.len(),
-            count.0,
-            count.1,
-            count.2
-        ))
-    }
-
-    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
-        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
-        bytes.put_u8(DIRENTRY_TYPE);
-        bytes.put(self.directory_name.as_bytes());
-        bytes.put_u64(self.children.len() as u64);
-        match bytes.as_array::<VAULTENTRY_LENGTH>() {
-            Some(e) => Ok(e.to_owned()),
-            None => Err(ReadVaultFileError::InvalidLengthError()),
-        }
-    }
 }
 
 impl PartialEq for DirectoryEntry {
@@ -731,6 +646,27 @@ impl PartialEq for DirectoryEntry {
 }
 impl Eq for DirectoryEntry {}
 
+impl Entry for DirectoryEntry {
+    fn display(&self) -> String {
+        format!("{}: {} Items", self.directory_name, self.children.len())
+    }
+
+    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], ReadVaultFileError> {
+        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
+        bytes.put_u8(DIRENTRY_TYPE);
+        bytes.put(self.directory_name.as_bytes());
+        bytes.put_u64(self.children.len() as u64);
+        match bytes.as_array::<VAULTENTRY_LENGTH>() {
+            Some(e) => Ok(e.to_owned()),
+            None => Err(ReadVaultFileError::InvalidLengthError()),
+        }
+    }
+
+    fn rename(&mut self, new_name: String) {
+        self.directory_name = new_name;
+    }
+}
+
 impl DirectoryEntry {
     fn get_sorted_children(&self) -> Vec<&VaultEntry> {
         let mut entries: Vec<&VaultEntry> = self.children.values().collect();
@@ -738,8 +674,163 @@ impl DirectoryEntry {
         entries
     }
 
+    fn get_directory_overview(&self, depth: u64, buffer: &mut String) -> Result<(), VaultError> {
+        write!(
+            buffer,
+            "{} {}",
+            build_prefix_str(depth, false),
+            self.display()
+        )
+        .map_err(|_| VaultError::WriteStdoutError)?;
+        let children = self.get_sorted_children();
+        let len = children.len();
+        for (i, entry) in children.into_iter().enumerate() {
+            let is_last = i == len - 1;
+            match entry {
+                VaultEntry::Password(pwd) => write!(
+                    buffer,
+                    "{} {}\n",
+                    build_prefix_str(depth, is_last),
+                    pwd.display()
+                )
+                .map_err(|_| VaultError::WriteStdoutError)?,
+                VaultEntry::Secret(sec) => write!(
+                    buffer,
+                    "{} {}\n",
+                    build_prefix_str(depth, is_last),
+                    sec.display()
+                )
+                .map_err(|_| VaultError::WriteStdoutError)?,
+                VaultEntry::Directory(dir) => {
+                    dir.get_directory_overview(depth + 1, buffer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn get_children(&self) -> Vec<&VaultEntry> {
         self.children.values().collect()
+    }
+
+    fn sorted_iter(&self) -> IntoIter<&VaultEntry> {
+        let sorted_entries = self.get_sorted_children();
+        let mut res: Vec<&VaultEntry> = Vec::new();
+        for entry in sorted_entries {
+            res.push(entry);
+            if let VaultEntry::Directory(dir) = entry {
+                dir.sorted_iter().for_each(|e| res.push(e));
+            }
+        }
+        res.into_iter()
+    }
+
+    fn iter(&self) -> IntoIter<&VaultEntry> {
+        let entries = self.get_children();
+        let mut res: Vec<&VaultEntry> = Vec::new();
+        for entry in entries {
+            res.push(entry);
+            if let VaultEntry::Directory(dir) = entry {
+                dir.iter().for_each(|e| res.push(e));
+            }
+        }
+        res.into_iter()
+    }
+
+    fn get_entry(
+        &self,
+        mut path: VecDeque<&str>,
+        &total_path: &String,
+    ) -> Result<&VaultEntry, VaultError> {
+        // pop next name
+        let name_opt = path.pop_front();
+        let name = match name_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(n) => Ok(n),
+        }?;
+        let entry_opt = self.children.get(name);
+        let entry = match entry_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(e) => Ok(e),
+        }?;
+
+        if path.is_empty() {
+            Ok(entry)
+        } else {
+            if let VaultEntry::Directory(dir) = entry {
+                dir.get_entry(path, &total_path)
+            } else {
+                Err(VaultError::EntryNotFound(total_path.clone()))
+            }
+        }
+    }
+
+    fn get_entry_mut(
+        &mut self,
+        mut path: VecDeque<&str>,
+        total_path: &String,
+    ) -> Result<&mut VaultEntry, VaultError> {
+        // pop next name
+        let name_opt = path.pop_front();
+        let name = match name_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(n) => Ok(n),
+        }?;
+        let entry_opt = self.children.get_mut(name);
+        let entry = match entry_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(e) => Ok(e),
+        }?;
+
+        if path.is_empty() {
+            Ok(entry)
+        } else {
+            if let VaultEntry::Directory(dir) = entry {
+                dir.get_entry_mut(path, total_path)
+            } else {
+                Err(VaultError::EntryNotFound(total_path.clone()))
+            }
+        }
+    }
+
+    /// Renames an entry and updates the entry in
+    fn rename_entry(
+        &mut self,
+        mut path: VecDeque<&str>,
+        total_path: &String,
+        new_name: String,
+    ) -> Result<(), VaultError> {
+        // pop next name
+        let name_opt = path.pop_front();
+        let name = match name_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(n) => Ok(n),
+        }?;
+
+        let entry_opt = self.children.get_mut(name);
+        let entry = match entry_opt {
+            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            Some(e) => Ok(e),
+        }?;
+
+        if path.is_empty() {
+            let name = entry.name().clone();
+            if self.children.contains_key(&new_name) {
+                Err(VaultError::DuplicateEntryError(new_name.clone()))
+            } else {
+                // clone to avoid the mutable borrow living on
+                let mut new_entry = self.children.remove(&name).unwrap();
+                new_entry.rename(new_name.clone());
+                self.children.insert(new_name, new_entry);
+                Ok(())
+            }
+        } else {
+            if let VaultEntry::Directory(dir) = entry {
+                dir.rename_entry(path, total_path, new_name)
+            } else {
+                Err(VaultError::EntryNotFound(total_path.clone()))
+            }
+        }
     }
 }
 
@@ -752,7 +843,7 @@ enum VaultEntry {
     Directory(DirectoryEntry),
 }
 
-impl Entry<EntryResult> for VaultEntry {
+impl VaultEntry {
     fn display(&self) -> String {
         match self {
             Self::Password(pwd) => pwd.display(),
@@ -774,7 +865,7 @@ impl Entry<EntryResult> for VaultEntry {
         reader: &mut BufReader<File>,
         data_start: u64,
         key: &[u8],
-    ) -> Result<EntryResult, ReadVaultFileError> {
+    ) -> Result<EntryResult, VaultError> {
         match self {
             VaultEntry::Password(pwd) => Ok(EntryResult::Password(
                 pwd.retrieve_secret(reader, data_start, key)?,
@@ -782,9 +873,26 @@ impl Entry<EntryResult> for VaultEntry {
             VaultEntry::Secret(sec) => Ok(EntryResult::Secret(
                 sec.retrieve_secret(reader, data_start, key)?,
             )),
-            VaultEntry::Directory(dir) => Ok(EntryResult::Directory(
-                dir.retrieve_secret(reader, data_start, key)?,
+            VaultEntry::Directory(dir) => Err(VaultError::InvalidOperation(
+                OperationType::RetrieveSecret,
+                VaultEntryType::Directory,
             )),
+        }
+    }
+
+    fn rename(&mut self, new_name: String) {
+        match self {
+            Self::Directory(dir) => dir.rename(new_name),
+            Self::Secret(sec) => sec.rename(new_name),
+            Self::Password(pwd) => pwd.rename(new_name),
+        }
+    }
+
+    fn name(&self) -> &String {
+        match self {
+            VaultEntry::Directory(dir) => &dir.directory_name,
+            VaultEntry::Secret(sec) => &sec.secret_name,
+            VaultEntry::Password(pwd) => &pwd.password_name,
         }
     }
 }

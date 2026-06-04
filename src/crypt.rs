@@ -14,9 +14,9 @@ pub const AES_NONCE_LENGTH: usize = 12;
 #[derive(Debug)]
 pub struct EncryptedData<const N: usize> {
     /// The nonce generated in the process
-    nonce: [u8; AES_NONCE_LENGTH],
+    pub nonce: [u8; AES_NONCE_LENGTH],
     /// The encrypted Data
-    data: [u8; N]
+    pub data: [u8; N]
 }
 
 
