@@ -1,8 +1,8 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::crypt::{
-    AES_NONCE_LENGTH, EncryptedData, IV_LENGTH, decrypt_region, decrypt_region_dyn, encrypt_region,
-    generate_user_key,
+    AES_NONCE_LENGTH, EncryptedDataArr, IV_LENGTH, decrypt_region, decrypt_region_dyn,
+    encrypt_dyn_region, encrypt_region, generate_user_key,
 };
 use crate::error::{
     InvalidFileReasons, OperationType, ReadFieldError, ReadVaultFileError, VaultEntryType,
@@ -220,7 +220,7 @@ impl VaultManager {
         //encrypt data and add to changes
         let mut raw_data: BytesMut = BytesMut::zeroed(DATABLOCK_RAW_LENGTH);
         raw_data.put(password.as_bytes());
-        let data: EncryptedData<DATABLOCK_LENGTH> = encrypt_region(
+        let data: EncryptedDataArr<DATABLOCK_LENGTH> = encrypt_region(
             raw_data
                 .freeze()
                 .as_array::<DATABLOCK_RAW_LENGTH>()
@@ -230,6 +230,7 @@ impl VaultManager {
         let path = entry_path.split('/').collect();
         let entry = self.root_entry.get_entry_mut(path, &entry_path)?;
         if let VaultEntry::Password(pwd) = entry {
+            pwd.nonce = data.nonce;
             self.buffered_changes.push(DataBlockChange::new(
                 pwd.secret_block_id,
                 1,
@@ -237,11 +238,85 @@ impl VaultManager {
             ));
             Ok(())
         } else if let VaultEntry::Directory(_) = entry {
-            Err(VaultError::InvalidOperation(OperationType::ChangePassword, VaultEntryType::Directory))
+            Err(VaultError::InvalidOperation(
+                OperationType::ChangePassword,
+                VaultEntryType::Directory,
+            ))
         } else {
-            Err(VaultError::InvalidOperation(OperationType::ChangePassword, VaultEntryType::Secret))
+            Err(VaultError::InvalidOperation(
+                OperationType::ChangePassword,
+                VaultEntryType::Secret,
+            ))
         }
-        //TODO: Decide if we should refactor cryptography lib to use Bytes
+    }
+
+    pub fn change_secret(
+        &mut self,
+        entry_path: String,
+        secret_file_path: String,
+    ) -> Result<(), VaultError> {
+        if self.empty_blocks.is_none() {
+            self.empty_blocks = Some(self.get_empty_data_blocks());
+        }
+        let entry = self
+            .root_entry
+            .get_entry_mut(entry_path.split('/').collect(), &entry_path)?;
+        let secret: &mut SecretFileEntry = match entry {
+            VaultEntry::Secret(sec) => Ok(sec),
+            VaultEntry::Password(_) => Err(VaultError::InvalidOperation(
+                OperationType::ChangeSecret,
+                VaultEntryType::Password,
+            )),
+            VaultEntry::Directory(_) => Err(VaultError::InvalidOperation(
+                OperationType::ChangeSecret,
+                VaultEntryType::Directory,
+            )),
+        }?;
+
+        //read file and encrypt
+        let path = Path::new(&secret_file_path);
+        let mut file = File::open(path)
+            .map_err(|e| VaultError::ReadVaultError(ReadVaultFileError::from(e)))?;
+        let mut filedata: Vec<u8> = Vec::new();
+        let read_bytes = file
+            .read_to_end(&mut filedata)
+            .map_err(|e| VaultError::ReadVaultError(ReadVaultFileError::from(e)))?;
+
+        //align data to be round_up((read_bytes+AES_GCM_AUTH_TAG) / DATABLOCK_LENGTH)
+        let block_len: usize = (read_bytes + AES_GCM_AUTH_TAG).div_ceil(DATABLOCK_LENGTH);
+
+        //prepare data block and encrypt
+        let mut data = BytesMut::zeroed(block_len);
+        data.put_slice(&filedata[..]);
+        let enc_data = encrypt_dyn_region(data.freeze(), &self.vault_key)?;
+
+        if secret.size as usize > block_len {
+            // Reduced the BlockRange -> mark the rest as empty blocks
+
+            self.empty_blocks.as_mut().unwrap().put(BlockRange::new(
+                secret.secret_block_id + block_len as u64,
+                block_len - secret.size as usize,
+            ));
+            secret.size = block_len as u64;
+            let mut new_data = BytesMut::from(enc_data.data);
+            new_data.resize(secret.size as usize, 0);
+            self.buffered_changes.push(DataBlockChange::new(
+                secret.secret_block_id,
+                secret.size as usize,
+                new_data.freeze(),
+            ));
+        } else if secret.size as usize == block_len {
+            //Can edit inplace
+            self.buffered_changes.push(DataBlockChange::new(
+                secret.secret_block_id,
+                secret.size as usize,
+                enc_data.data,
+            ));
+        } else {
+            //Increased size -> TODO Mark current BlockRange as empty and find new spot
+            
+        }
+        Ok(())
     }
 }
 

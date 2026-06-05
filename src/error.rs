@@ -3,6 +3,7 @@ use std::string::FromUtf8Error;
 pub enum CryptographyError {
     InauthenticTag,
     InvalidLength { expected: usize, actual: usize },
+    InternalError(aes_gcm::Error),
 }
 
 impl fmt::Display for CryptographyError {
@@ -19,14 +20,19 @@ impl fmt::Display for CryptographyError {
 }
 
 pub enum ReadVaultFileError {
-    ReadError(ReadFieldError, u64),
     ReadFileError(std::io::Error),
-    ReadEntryError(ReadFieldError, u64),
+    ReadEntryError(ReadFieldError, Option<u64>),
     InvalidFile(InvalidFileReasons),
     ReadStdinError(std::io::Error),
     InAuthenticTagError(),
     InvalidLengthError(),
     InternalError(String),
+}
+
+impl From<std::io::Error> for ReadVaultFileError {
+    fn from(value: std::io::Error) -> Self {
+        Self::ReadFileError(value)
+    }
 }
 
 pub enum InvalidFileReasons {
