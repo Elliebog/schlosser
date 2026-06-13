@@ -1,9 +1,13 @@
-use crate::error::CryptographyError;
+use std::{fs::File, io::Read};
+
+use crate::{
+    vault::manager::{AES_GCM_AUTH_TAG, DATABLOCK_LENGTH},
+};
 use aes_gcm::{
-    AeadCore, Aes256Gcm, Key, KeyInit,
+    AeadCore, Aes256Gcm, Error, Key, KeyInit,
     aead::{Aead, OsRng},
 };
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use pbkdf2::pbkdf2_hmac_array;
 use sha2::Sha256;
 
@@ -12,6 +16,15 @@ pub const IV_LENGTH: usize = 16;
 const PBKDF2_ITERATIONS: usize = 300000;
 const KEY_LENGTH: usize = 32;
 pub const AES_NONCE_LENGTH: usize = 12;
+
+pub struct CryptographyError {
+    pub message: String
+}
+
+pub enum EncryptFileError {
+    CryptoError(CryptographyError),
+    FileError(std::io::Error)
+}
 
 /// Struct that holds the result of an encryption operation
 #[derive(Debug)]
@@ -24,7 +37,7 @@ pub struct EncryptedData {
 
 pub struct EncryptedDataArr<const N: usize> {
     pub nonce: [u8; AES_NONCE_LENGTH],
-    pub data: [u8; N]
+    pub data: [u8; N],
 }
 
 /// Generate the user key using the PBKDF2 algorithm
@@ -45,13 +58,12 @@ pub fn decrypt_region<const N: usize>(
     //Decrypt the target data and truncate to exclude the authentication tag
     let mut data = cipher
         .decrypt(nonce.into(), &data[..])
-        .map_err(|_| CryptographyError::InauthenticTag)?;
+        .map_err(|e| CryptographyError {
+            message: e.to_string(),
+        })?;
     data.truncate(N);
     match data.as_array::<N>() {
-        None => Err(CryptographyError::InvalidLength {
-            expected: N,
-            actual: data.len(),
-        }),
+        None => panic!("Internal AES-GCM Error. Unexpected Length Mismatch during decryption"),
         Some(d) => Ok(d.to_owned()),
     }
 }
@@ -68,7 +80,9 @@ pub fn decrypt_region_dyn(
 
     let data = cipher
         .decrypt(nonce.into(), &data[..])
-        .map_err(|_| CryptographyError::InauthenticTag)?;
+        .map_err(|e| CryptographyError {
+            message: e.to_string(),
+        })?;
     Ok(data)
 }
 
@@ -78,7 +92,7 @@ pub fn encrypt_dyn_region(data: Bytes, key: &[u8]) -> Result<EncryptedData, Cryp
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let encrypted_data = cipher
         .encrypt(&nonce, &data[..])
-        .map_err(|_| CryptographyError::InauthenticTag)?;
+        .map_err(|e| CryptographyError {message: e.to_string()})?;
     let data = EncryptedData {
         nonce: nonce.into(),
         data: Bytes::from(encrypted_data),
@@ -88,6 +102,7 @@ pub fn encrypt_dyn_region(data: Bytes, key: &[u8]) -> Result<EncryptedData, Cryp
 
 /// Encrypt a region with length N. This returns the encrypted data as well as the nonce used.
 /// The resulting Data length will be N+16 bytes long. (Authentication tag)
+/// Returns Cryptography::InternalError should the encryption fail
 pub fn encrypt_region<const N: usize>(
     data: &[u8; N],
     key: &[u8],
@@ -97,16 +112,31 @@ pub fn encrypt_region<const N: usize>(
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let encrypted_data = cipher
         .encrypt(&nonce, &data[..])
-        .map_err(|e| CryptographyError::InternalError(e))?;
+        .map_err(|e| CryptographyError { message: e.to_string() })?;
     let data = encrypted_data.as_array::<{ N + 16 }>();
     match data {
-        None => Err(CryptographyError::InvalidLength {
-            expected: N + 16,
-            actual: encrypted_data.len(),
-        }),
+        None => panic!("Internal AES-GCM Error. Unexpected Length mismatch during encryption"),
         Some(d) => Ok(EncryptedDataArr {
             nonce: nonce.into(),
             data: d.to_owned(),
         }),
     }
+}
+
+/// Read a file and encrypt its contents. The returned bytes will be a multiple of DATABLOCK_LENGTH
+/// long.
+pub fn encrypt_file(filepath: String, key: &[u8]) -> Result<EncryptedData, EncryptFileError> {
+    let mut file = File::open(filepath).map_err(|e| EncryptFileError::FileError(e))?;
+    let mut filedata: Vec<u8> = Vec::new();
+
+    let bytes_read = file
+        .read_to_end(&mut filedata)
+        .map_err(|e| EncryptFileError::FileError(e))?;
+    let size = (bytes_read + AES_GCM_AUTH_TAG).div_ceil(DATABLOCK_LENGTH);
+    let mut bytes = BytesMut::zeroed(size * DATABLOCK_LENGTH);
+    bytes.put_slice(&filedata);
+
+    let enc_data =
+        encrypt_dyn_region(bytes.freeze(), key).map_err(|e| EncryptFileError::CryptoError(e))?;
+    Ok(enc_data)
 }
