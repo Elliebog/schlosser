@@ -4,6 +4,19 @@ use crate::{crypt::CryptographyError, vault::utils::VaultPath};
 
 pub enum ReadVaultFileError {
     FileError(std::io::Error),
+    ReadFieldError(ReadFieldError, u64),
+    InvalidFile(InvalidFileReasons),
+    UTF8Error(FromUtf8Error, u64),
+    ReadUserKeyError(std::io::Error),
+    CryptographyError(CryptographyError)
+}
+
+pub enum InvalidFileReasons {
+    WrongSignature,
+    UnsupportedVersion,
+    NoRootEntry,
+    InvalidVaultStructure,
+    UnkownEntryType
 }
 
 pub enum RetrieveSecretError {
@@ -51,15 +64,17 @@ pub enum DeleteEntryError {
 
 pub enum NewEntryError {
     VaultError(VaultError),
-    NameError(NameLengthExceededError),
+    NameLengthError(NameLengthExceededError),
     InvalidVaultPath(InvalidVaultPathError),
     VaultChangeError(VaultChangeError)
 }
 
+#[derive(Debug)]
 pub struct InvalidVaultPathError {
      pub path: String
 }
 
+#[derive(Debug)]
 pub struct NameLengthExceededError {
     pub len: usize
 }
@@ -104,6 +119,7 @@ pub enum VaultChangeError {
     InputTooLarge,
     FileError(std::io::Error),
     CryptographyError(CryptographyError),
+    ExceededNameLength(NameLengthExceededError),
 }
 
 impl From<CryptographyError> for VaultChangeError {
@@ -117,9 +133,9 @@ pub enum SerializationError {
 }
 
 pub enum VaultError{
+    NameError(NameLengthExceededError),
     EntryNotFound(VaultPath),
     DuplicateEntry(String), 
-    ExceededNameLength(usize),
 }
 
 

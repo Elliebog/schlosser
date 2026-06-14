@@ -12,11 +12,13 @@ use crate::{
     crypt::{AES_NONCE_LENGTH, EncryptFileError, encrypt_file, encrypt_region},
     vault::{
         error::{
-            EntryType, NameLengthExceededError, Operation, RetrieveSecretError, SerializationError, VaultChangeError, VaultError
+            EntryType, NameLengthExceededError, Operation, ReadVaultFileError, RetrieveSecretError,
+            SerializationError, VaultChangeError, VaultError,
         },
         manager::{
-            DATABLOCK_LENGTH, DIRENTRY_TYPE, DataBlockChange, PASSWORDENTRY_TYPE, SECRETENTRY_TYPE,
-            VAULTENTRY_LENGTH, VAULTNAME_LENGTH, VaultChangeContext,
+            BLOCKID_LENGTH, DATABLOCK_LENGTH, DIRENTRY_SIZE_LENGTH, DIRENTRY_TYPE, DataBlockChange,
+            PASSWORDENTRY_TYPE, SECRET_SIZE_LENGTH, SECRETENTRY_TYPE, VAULTENTRY_LENGTH,
+            VAULTENTRYNAME_LENGTH, VAULTNAME_LENGTH, VaultChangeContext,
         },
         utils::{BlockRange, BlockSet, VaultPath, read_data_block, read_dyn_data_block},
     },
@@ -67,7 +69,10 @@ pub trait EncryptedEntry<I, O> {
 pub trait Entry {
     fn display(&self) -> String;
     fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], SerializationError>;
-    fn rename(&mut self, new_name: String);
+    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    where
+        Self: Sized;
+    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError>;
     fn occupied_datablocks(&self) -> BlockSet;
 }
 
@@ -103,6 +108,11 @@ impl EncryptedEntry<String, String> for PasswordEntry {
         context: &mut VaultChangeContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError> {
+        if name.len() > VAULTENTRY_LENGTH {
+            return Err(VaultChangeError::ExceededNameLength(
+                NameLengthExceededError { len: name.len() },
+            ));
+        }
         let mut data = BytesMut::zeroed(DATABLOCK_LENGTH);
         data.put_slice(input.as_bytes());
         let arr = match data.as_array::<DATABLOCK_LENGTH>() {
@@ -170,14 +180,46 @@ impl Entry for PasswordEntry {
         }
     }
 
-    fn rename(&mut self, new_name: String) {
-        self.password_name = new_name;
+    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+        if new_name.len() > VAULTNAME_LENGTH {
+            Err(NameLengthExceededError {
+                len: new_name.len(),
+            })
+        } else {
+            self.password_name = new_name;
+            Ok(())
+        }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
         let mut blocks = BlockSet::new();
         blocks.put(BlockRange::new(self.secret_block_id, 1));
         blocks
+    }
+
+    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    where
+        Self: Sized,
+    {
+        //Password Entry
+        let mut offset: usize = 1;
+        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+        offset += VAULTENTRYNAME_LENGTH;
+        // Because array of Copy types are copied when doing a slice this does not consume the
+        // entry_data array
+        let blk_id = u64::from_ne_bytes(data[offset..offset + BLOCKID_LENGTH].try_into().unwrap());
+        offset += BLOCKID_LENGTH;
+        let nonce: [u8; AES_NONCE_LENGTH] =
+            data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+        Ok((
+            0,
+            PasswordEntry {
+                password_name: name,
+                secret_block_id: blk_id,
+                nonce,
+            },
+        ))
     }
 }
 
@@ -219,6 +261,11 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
         context: &mut VaultChangeContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError> {
+        if name.len() > VAULTNAME_LENGTH {
+            return Err(VaultChangeError::ExceededNameLength(
+                NameLengthExceededError { len: name.len() },
+            ));
+        }
         let data = encrypt_file(input, key).map_err(|e| match e {
             EncryptFileError::CryptoError(e) => VaultChangeError::CryptographyError(e),
             EncryptFileError::FileError(e) => VaultChangeError::FileError(e),
@@ -317,8 +364,44 @@ impl Entry for SecretFileEntry {
         }
     }
 
-    fn rename(&mut self, new_name: String) {
-        self.secret_name = new_name;
+    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    where
+        Self: Sized,
+    {
+        //Secret File Entry
+        let mut offset = 1;
+        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+        offset += VAULTENTRYNAME_LENGTH;
+        // Because array of Copy types are copied when doing a slice this does not consume the
+        // entry_data array
+        let blk_id = u64::from_ne_bytes(data[offset..offset + BLOCKID_LENGTH].try_into().unwrap());
+        offset += BLOCKID_LENGTH;
+        let size = u64::from_ne_bytes(
+            data[offset..offset + SECRET_SIZE_LENGTH]
+                .try_into()
+                .unwrap(),
+        );
+        offset += SECRET_SIZE_LENGTH;
+        let nonce: [u8; AES_NONCE_LENGTH] =
+            data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+        Ok((0, SecretFileEntry {
+            secret_name: name,
+            secret_block_id: blk_id,
+            size,
+            nonce,
+        }))
+    }
+
+    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+        if new_name.len() > VAULTNAME_LENGTH {
+            Err(NameLengthExceededError {
+                len: new_name.len(),
+            })
+        } else {
+            self.secret_name = new_name;
+            Ok(())
+        }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
@@ -366,8 +449,40 @@ impl Entry for DirectoryEntry {
         }
     }
 
-    fn rename(&mut self, new_name: String) {
-        self.directory_name = new_name;
+    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    where
+        Self: Sized,
+    {
+        // Directory Entry
+        let mut offset: usize = 1;
+        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+        offset += VAULTENTRYNAME_LENGTH;
+        // Because array of Copy types are copied when doing a slice this does not consume the
+        // entry_data array
+        let size = u64::from_ne_bytes(
+            data[offset..offset + DIRENTRY_SIZE_LENGTH]
+                .try_into()
+                .unwrap(),
+        );
+        Ok((
+            size,
+            DirectoryEntry {
+                directory_name: name,
+                children: HashMap::new(),
+            },
+        ))
+    }
+
+    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+        if new_name.len() > VAULTNAME_LENGTH {
+            Err(NameLengthExceededError {
+                len: new_name.len(),
+            })
+        } else {
+            self.directory_name = new_name;
+            Ok(())
+        }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
@@ -383,13 +498,15 @@ impl Entry for DirectoryEntry {
 }
 
 impl DirectoryEntry {
-    pub fn new(dir_name: String) -> Result<Self, NameLengthExceededError>{
+    pub fn new(dir_name: String) -> Result<Self, NameLengthExceededError> {
         if dir_name.len() > VAULTNAME_LENGTH {
-            Err(NameLengthExceededError {len: dir_name.len()})
+            Err(NameLengthExceededError {
+                len: dir_name.len(),
+            })
         } else {
             Ok(DirectoryEntry {
                 children: HashMap::new(),
-                directory_name: dir_name
+                directory_name: dir_name,
             })
         }
     }
@@ -536,7 +653,9 @@ impl DirectoryEntry {
         if path.is_empty() {
             //Check if name conforms with name length restrictions
             if new_name.len() > VAULTNAME_LENGTH {
-                return Err(VaultError::ExceededNameLength(new_name.len()));
+                return Err(VaultError::NameError(NameLengthExceededError {
+                    len: new_name.len(),
+                }));
             }
 
             if self.children.contains_key(&new_name) {
@@ -544,6 +663,8 @@ impl DirectoryEntry {
             } else {
                 // Verified already that it exists. can unwrap
                 let mut new_entry = self.children.remove(name).unwrap();
+                // Rename always succeeds because we check it earlier to avoid ugly interactions
+                // with remove
                 new_entry.rename(new_name.clone());
                 self.children.insert(new_name, new_entry);
                 Ok(())
@@ -573,7 +694,9 @@ impl DirectoryEntry {
         if path.is_empty() {
             if let Some(entry) = self.children.remove(name) {
                 for block in entry.occupied_blocks().into_iter() {
-                    context.changes.push(DataBlockChange::new(block.start, block.len(), None));
+                    context
+                        .changes
+                        .push(DataBlockChange::new(block.start, block.len(), None));
                 }
             }
             Ok(())
@@ -671,12 +794,12 @@ impl VaultEntry {
         }
     }
 
-    pub fn rename(&mut self, new_name: String) {
+    pub fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
         match self {
             Self::Directory(dir) => dir.rename(new_name),
             Self::Secret(sec) => sec.rename(new_name),
             Self::Password(pwd) => pwd.rename(new_name),
-        }
+        };
     }
 
     pub fn name(&self) -> &String {
