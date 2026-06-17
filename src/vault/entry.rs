@@ -799,7 +799,7 @@ impl VaultEntry {
             Self::Directory(dir) => dir.rename(new_name),
             Self::Secret(sec) => sec.rename(new_name),
             Self::Password(pwd) => pwd.rename(new_name),
-        };
+        }
     }
 
     pub fn name(&self) -> &String {

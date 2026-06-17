@@ -8,7 +8,8 @@ pub enum ReadVaultFileError {
     InvalidFile(InvalidFileReasons),
     UTF8Error(FromUtf8Error, u64),
     ReadUserKeyError(std::io::Error),
-    CryptographyError(CryptographyError)
+    CryptographyError(CryptographyError),
+    RetrieveKeyError(RetrieveKeyError)
 }
 
 pub enum InvalidFileReasons {
@@ -20,12 +21,13 @@ pub enum InvalidFileReasons {
 }
 
 pub enum RetrieveSecretError {
-    InvalidVaultPath(String),
+    InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError),
     FileError(std::io::Error),
     UTF8Error(FromUtf8Error),
     DataBlockError(ReadDataBlockError),
-    InvalidOperation(Operation, EntryType)
+    InvalidOperation(Operation, EntryType),
+    RetrieveKeyError(RetrieveKeyError),
 }
 
 impl From<VaultError> for RetrieveSecretError {
@@ -66,7 +68,8 @@ pub enum NewEntryError {
     VaultError(VaultError),
     NameLengthError(NameLengthExceededError),
     InvalidVaultPath(InvalidVaultPathError),
-    VaultChangeError(VaultChangeError)
+    VaultChangeError(VaultChangeError),
+    RetrieveKeyError(RetrieveKeyError)
 }
 
 #[derive(Debug)]
@@ -83,7 +86,8 @@ pub enum VaultChangeEntryError {
     VaultChangeError(VaultChangeError),
     InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError),
-    InvalidOperation(Operation, EntryType)
+    InvalidOperation(Operation, EntryType),
+    RetrieveKeyError(RetrieveKeyError)
 }
 
 impl From<VaultError> for VaultChangeEntryError {
@@ -139,3 +143,7 @@ pub enum VaultError{
 }
 
 
+pub enum RetrieveKeyError {
+    StdinError(std::io::Error),
+    DecryptError(CryptographyError)
+}

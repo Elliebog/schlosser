@@ -14,7 +14,7 @@ use sha2::Sha256;
 /// The length of the initialization Vector designed to be used in PBKDF2 key generation
 pub const IV_LENGTH: usize = 16;
 const PBKDF2_ITERATIONS: usize = 300000;
-const KEY_LENGTH: usize = 32;
+pub const KEY_LENGTH: usize = 32;
 pub const AES_NONCE_LENGTH: usize = 12;
 
 pub struct CryptographyError {
