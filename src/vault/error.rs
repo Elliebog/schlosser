@@ -21,6 +21,7 @@ pub enum InvalidFileReasons {
 }
 
 pub enum RetrieveSecretError {
+    InvalidDataBlockError(i64),
     InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError),
     FileError(std::io::Error),
@@ -57,6 +58,11 @@ pub enum EntryType {
 pub enum RenameEntryError {
     InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError)
+}
+
+pub enum RenameError {
+    SerializationError(SerializationError),
+    NameError(NameLengthExceededError)
 }
 
 pub enum DeleteEntryError {
@@ -124,6 +130,7 @@ pub enum VaultChangeError {
     FileError(std::io::Error),
     CryptographyError(CryptographyError),
     ExceededNameLength(NameLengthExceededError),
+    SerializeError(SerializationError)
 }
 
 impl From<CryptographyError> for VaultChangeError {
@@ -134,6 +141,7 @@ impl From<CryptographyError> for VaultChangeError {
 
 pub enum SerializationError {
     InvalidLength,
+    EncryptError(CryptographyError)
 }
 
 pub enum VaultError{
@@ -147,3 +155,15 @@ pub enum RetrieveKeyError {
     StdinError(std::io::Error),
     DecryptError(CryptographyError)
 }
+
+pub enum EncryptVaultTableError {
+    SerializationError(SerializationError),
+    EncryptVaultError(CryptographyError),
+    RetrieveKeyError(RetrieveKeyError)
+}
+
+pub enum SaveVaultError {
+    EncryptVaultTableError(EncryptVaultTableError),
+    FileError(std::io::Error)
+}
+

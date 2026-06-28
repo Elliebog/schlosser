@@ -6,19 +6,20 @@ use std::{
     vec::IntoIter,
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, EncryptFileError, encrypt_file, encrypt_region},
+    crypt::{AES_NONCE_LENGTH, EncryptFileError, decrypt_region, encrypt_file, encrypt_region},
     vault::{
         error::{
-            EntryType, NameLengthExceededError, Operation, ReadVaultFileError, RetrieveSecretError,
-            SerializationError, VaultChangeError, VaultError,
+            EntryType, NameLengthExceededError, Operation, ReadVaultFileError, RenameError,
+            RetrieveSecretError, SerializationError, VaultChangeError, VaultError,
         },
         manager::{
-            BLOCKID_LENGTH, DATABLOCK_LENGTH, DIRENTRY_SIZE_LENGTH, DIRENTRY_TYPE, DataBlockChange,
-            PASSWORDENTRY_TYPE, SECRET_SIZE_LENGTH, SECRETENTRY_TYPE, VAULTENTRY_LENGTH,
-            VAULTENTRYNAME_LENGTH, VAULTNAME_LENGTH, VaultChangeContext,
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DIRENTRY_SIZE_LENGTH,
+            DIRENTRY_TYPE, DataBlockChange, PASSWORDENTRY_TYPE, SECRET_SIZE_LENGTH,
+            SECRETENTRY_TYPE, VAULTENTRY_LENGTH, VAULTENTRYNAME_LENGTH, VAULTNAME_LENGTH,
+            VaultChangeContext,
         },
         utils::{BlockRange, BlockSet, VaultPath, read_data_block, read_dyn_data_block},
     },
@@ -27,6 +28,9 @@ use crate::{
 const V_CONNECTOR: &str = "│\t";
 const LITERAL: &str = "├─ ";
 const END_LITERAL: &str = "└ ";
+
+const PWDENTRY_ENC_LENGTH: usize =
+    VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + AES_NONCE_LENGTH + AES_GCM_AUTH_TAG;
 
 /// An Enum representing the result of an entry secret retrieval
 pub enum EntryResult {
@@ -67,24 +71,42 @@ pub trait EncryptedEntry<I, O> {
 /// Basic trait that every trait should implement
 /// The same caveats as for `EncryptedEntry<T>` trait apply
 pub trait Entry {
+    /// Displays general information about the entry
     fn display(&self) -> String;
-    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], SerializationError>;
+    /// Serializes the entry into an array that fits inside a datablock
+    fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError>;
     fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
     where
         Self: Sized;
-    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError>;
+    fn rename(
+        &mut self,
+        new_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<(), NameLengthExceededError>;
     fn occupied_datablocks(&self) -> BlockSet;
 }
 
 /// Entry that holds a password
+/// The entry follows the following structure in the file (differs from in memory significantly):
+/// Nonce - The nonce for the direntry block
+/// Type - The type of the directory entry (u8)
+/// Name - Name of the directory entry ([u8, 128])
+/// Next - index of the next directory entry block (i64)
+/// block - Block Id of the password block (i64)
+/// block_nonce - Nonce of the password block ([u8, 16])
 #[derive(Debug, PartialEq, Eq)]
 pub struct PasswordEntry {
     /// Name of the password
-    password_name: String,
-    /// Id of the secret block
-    secret_block_id: u64,
+    name: [u8; VAULTENTRYNAME_LENGTH],
+    /// The block id of the entry
+    block: u64,
+    /// Index of the next directory entry block in directory (-1 if end of directory)
+    next: i64,
+    /// Id of the password block
+    pwd_block: u64,
     /// Nonce used for decryption of the datablock
-    nonce: [u8; AES_NONCE_LENGTH],
+    pwd_block_nonce: [u8; AES_NONCE_LENGTH],
 }
 
 impl EncryptedEntry<String, String> for PasswordEntry {
@@ -94,8 +116,12 @@ impl EncryptedEntry<String, String> for PasswordEntry {
         data_start: u64,
         key: &[u8],
     ) -> Result<String, RetrieveSecretError> {
-        let data_block_start = data_start + self.secret_block_id * DATABLOCK_LENGTH as u64;
-        let data = read_data_block(reader, data_block_start, key, &self.nonce)?;
+        if self.pwd_block > 0 {
+            return Err(RetrieveSecretError::InvalidDataBlockError(self.pwd_block));
+        }
+        // Overflow cannot happen as the cap on u64 is so high it will never be reached
+        let datablock_offset = data_start + self.pwd_block as u64 * DATABLOCK_LENGTH as u64;
+        let data = read_data_block(reader, datablock_offset, key, &self.pwd_block_nonce)?;
 
         // Passwords are encrypted by first padding the field with 0's
         // To get the original password we discard anything that is not ascii
@@ -108,11 +134,16 @@ impl EncryptedEntry<String, String> for PasswordEntry {
         context: &mut VaultChangeContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError> {
-        if name.len() > VAULTENTRY_LENGTH {
+        if name.len() > VAULTENTRYNAME_LENGTH {
             return Err(VaultChangeError::ExceededNameLength(
                 NameLengthExceededError { len: name.len() },
             ));
         }
+        //convert name to u8 buffer
+        let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        namebuffer.put(name.as_bytes());
+        let buffer = namebuffer.freeze();
+
         let mut data = BytesMut::zeroed(DATABLOCK_LENGTH);
         data.put_slice(input.as_bytes());
         let arr = match data.as_array::<DATABLOCK_LENGTH>() {
@@ -120,19 +151,32 @@ impl EncryptedEntry<String, String> for PasswordEntry {
             None => Err(VaultChangeError::InputTooLarge),
             Some(a) => Ok(a),
         }?;
+
         let enc_data = encrypt_region(arr, key)?;
-        let block = context.empty_blocks.occupy(1);
+        let pwd_block = context.empty_blocks.occupy(1);
+        let entry_block = context.empty_blocks.occupy(1);
         let entry = PasswordEntry {
-            password_name: name,
-            secret_block_id: block.start,
-            nonce: enc_data.nonce,
+            name: buffer.as_array().unwrap().to_owned(),
+            block: entry_block.start,
+            next: -1,
+            pwd_block: pwd_block.start,
+            pwd_block_nonce: enc_data.nonce,
         };
-        let change = DataBlockChange::new(
-            block.start,
-            block.len(),
-            Some(Bytes::copy_from_slice(&enc_data.data)),
-        );
-        context.changes.push(change);
+
+        // Push DataBlock first and password entry block after
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: pwd_block.start,
+            len: pwd_block.len(),
+            data: Bytes::copy_from_slice(&enc_data.data),
+        });
+        let serialized_entry = entry
+            .serialize(key)
+            .map_err(|e| VaultChangeError::SerializeError(e))?;
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: entry_block.start,
+            len: entry_block.len(),
+            data: Bytes::copy_from_slice(&serialized_entry),
+        });
         Ok(entry)
     }
 
@@ -149,13 +193,13 @@ impl EncryptedEntry<String, String> for PasswordEntry {
             None => Err(VaultChangeError::InputTooLarge),
             Some(a) => Ok(a),
         }?;
+
+        // Because this is a password we can change in place
         let enc_data = encrypt_region(arr, key)?;
-        let block = context.empty_blocks.occupy(1);
-        self.nonce = enc_data.nonce;
-        self.secret_block_id = block.start;
+        self.pwd_block_nonce = enc_data.nonce;
         context.changes.push(DataBlockChange::new(
-            block.start,
-            block.len(),
+            self.pwd_block,
+            1,
             Some(Bytes::copy_from_slice(&enc_data.data)),
         ));
         Ok(())
@@ -164,45 +208,88 @@ impl EncryptedEntry<String, String> for PasswordEntry {
 
 impl Entry for PasswordEntry {
     fn display(&self) -> String {
-        format!("{} (Password)", self.password_name)
+        format!(
+            "{} (Password)",
+            String::from_utf8(self.name.to_vec()).unwrap()
+        )
     }
 
-    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], SerializationError> {
-        let mut entry = BytesMut::zeroed(VAULTENTRY_LENGTH);
+    fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError> {
+        let mut enc_section = BytesMut::zeroed(PWDENTRY_ENC_LENGTH);
+        enc_section.put_slice(&self.name);
+        enc_section.put_i64(self.next);
+        enc_section.put_u64(self.pwd_block);
+        enc_section.put_slice(&self.pwd_block_nonce);
+
+        let arr = encrypt_region(enc_section.as_array::<PWDENTRY_ENC_LENGTH>().unwrap(), key)
+            .map_err(|e| SerializationError::EncryptError(e))?;
+
+        let mut entry = BytesMut::zeroed(DATABLOCK_LENGTH);
         entry.put_u8(PASSWORDENTRY_TYPE);
-        entry.put(self.password_name.as_bytes());
-        entry.put_u64(self.secret_block_id);
-        entry.put(&self.nonce[..]);
-        // Extra insurance if string manipulation was not handled properly
-        match entry.as_array::<VAULTENTRY_LENGTH>() {
-            Some(e) => Ok(e.to_owned()),
-            None => Err(SerializationError::InvalidLength),
-        }
+        entry.put_slice(&arr.nonce);
+        entry.put_slice(&arr.data);
+        Ok(entry.freeze().as_array().unwrap().to_owned())
     }
 
-    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+    fn rename(
+        &mut self,
+        new_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
-            Err(NameLengthExceededError {
+            Err(RenameError::NameError(NameLengthExceededError {
                 len: new_name.len(),
-            })
+            }))
         } else {
-            self.password_name = new_name;
+            //convert name to u8 buffer
+            let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+            namebuffer.put(new_name.as_bytes());
+            let buffer = namebuffer.freeze();
+
+            self.name = buffer.as_array().unwrap().to_owned();
+
+            let new_entry = self
+                .serialize(key)
+                .map_err(|e| RenameError::SerializationError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&new_entry),
+            });
             Ok(())
         }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
         let mut blocks = BlockSet::new();
-        blocks.put(BlockRange::new(self.secret_block_id, 1));
+        blocks.put(BlockRange::new(self.pwd_block, 1));
+        blocks.put(BlockRange::new(self.block, 1));
         blocks
     }
 
-    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    fn build_entry(
+        data: [u8; VAULTENTRY_LENGTH],
+        key: &[u8],
+    ) -> Result<(u64, Self), ReadVaultFileError>
     where
         Self: Sized,
     {
         //Password Entry
         let mut offset: usize = 1;
+        // build_entry function starts after the type of entry has been determined
+        // can safely unwrap because we always take at least AES_NONCE_LENGTH items and it is
+        // guaranteed to have space due to fixed array length
+        let nonce: &[u8; AES_NONCE_LENGTH] =
+            &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+        offset += AES_NONCE_LENGTH;
+        let entry_data = decrypt_region(
+            &data[offset..offset + PWDENTRY_ENC_LENGTH]
+                .try_into()
+                .unwrap(),
+            nonce,
+            key,
+        );
         let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
             .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
@@ -385,12 +472,15 @@ impl Entry for SecretFileEntry {
         offset += SECRET_SIZE_LENGTH;
         let nonce: [u8; AES_NONCE_LENGTH] =
             data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
-        Ok((0, SecretFileEntry {
-            secret_name: name,
-            secret_block_id: blk_id,
-            size,
-            nonce,
-        }))
+        Ok((
+            0,
+            SecretFileEntry {
+                secret_name: name,
+                secret_block_id: blk_id,
+                size,
+                nonce,
+            },
+        ))
     }
 
     fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
@@ -419,6 +509,13 @@ pub struct DirectoryEntry {
     /// Entries that are in the directory. A Hashmap is used to facilitate faster password and
     /// secret lookups
     children: HashMap<String, VaultEntry>,
+    block: DirectoryEntryBlock,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryEntryBlock {
+    next_entry: Option<u64>,
+    first_child: Option<u64>,
 }
 
 impl PartialEq for DirectoryEntry {
@@ -428,7 +525,7 @@ impl PartialEq for DirectoryEntry {
         }
         let other_values: Vec<&VaultEntry> = other.children.values().collect();
         let self_values: Vec<&VaultEntry> = self.children.values().collect();
-        other_values == self_values
+        other_values == self_values && self.block == other.block
     }
 }
 impl Eq for DirectoryEntry {}
@@ -458,6 +555,7 @@ impl Entry for DirectoryEntry {
         let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
             .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
+
         // Because array of Copy types are copied when doing a slice this does not consume the
         // entry_data array
         let size = u64::from_ne_bytes(
@@ -509,6 +607,26 @@ impl DirectoryEntry {
                 directory_name: dir_name,
             })
         }
+    }
+
+    pub fn serialize_dir(&self) -> Result<Bytes, SerializationError> {
+        let mut bytes = BytesMut::with_capacity(VAULTENTRY_LENGTH * self.children.len());
+        // Serialize self
+        bytes.put_slice(&self.serialize()?);
+        for entry in self.children.values() {
+            if let VaultEntry::Directory(dir) = entry {
+                let subdir_bytes = dir.serialize_dir()?;
+                // bytes only has space for self.children.len() amount of vault entries -> Reserve
+                // space for sub-directory contents.
+                // serialize_dir includes the directory entry and not just the subdirectory contents
+                // -> but the space for directory entry exists -> only reserve subdir content bytes
+                bytes.reserve(subdir_bytes.len() - VAULTENTRY_LENGTH);
+                bytes.put(subdir_bytes);
+            } else {
+                bytes.put_slice(&entry.serialize()?);
+            }
+        }
+        Ok(bytes.freeze())
     }
 
     pub fn get_sorted_children(&self) -> Vec<&VaultEntry> {

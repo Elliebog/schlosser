@@ -1,15 +1,21 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use zeroize::Zeroize;
 
-use crate::crypt::{AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key};
+use crate::crypt::{
+    AES_NONCE_LENGTH, EncryptedData, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn,
+    encrypt_dyn_region, generate_user_key,
+};
 use crate::vault::entry::{
     DirectoryEntry, EncryptedEntry, Entry, EntryResult, PasswordEntry, SecretFileEntry, VaultEntry,
 };
 use crate::vault::error::{
-    DeleteEntryError, EntryType, InvalidFileReasons, NewEntryError, Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError, VaultChangeEntryError, VaultError
+    DeleteEntryError, EncryptVaultTableError, EntryType, InvalidFileReasons, NewEntryError,
+    Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
+    SaveVaultError, VaultChangeEntryError,
 };
 use crate::vault::utils::{BlockSet, VaultPath, read_dyn_field, read_field};
-use std::io::{BufWriter, Seek, SeekFrom};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::{
     collections::VecDeque,
     fs::File,
@@ -33,7 +39,7 @@ const VAULTTABLE_SIZE_LENGTH: usize = 8; //64 bit for u64
 pub(crate) const PASSWORDENTRY_TYPE: u8 = 0;
 pub(crate) const SECRETENTRY_TYPE: u8 = 1;
 pub(crate) const DIRENTRY_TYPE: u8 = 2;
-pub(crate) const VAULTENTRY_LENGTH: usize = 157;
+pub(crate) const VAULTENTRY_LENGTH: usize = 177;
 pub const VAULTENTRYNAME_LENGTH: usize = 128;
 const VAULTENTRYTYPE_LENGTH: usize = 1;
 pub const DIRENTRY_SIZE_LENGTH: usize = 8;
@@ -86,9 +92,9 @@ impl VaultManager {
         Ok(out)
     }
 
-    pub fn retrieve_secret_entry(
+    fn retrieve_secret_entry(
         &self,
-        entry_path: String,
+        entry_path: &String,
     ) -> Result<EntryResult, RetrieveSecretError> {
         let path = VaultPath::new(entry_path.clone())
             .map_err(|e| RetrieveSecretError::InvalidVaultPath(e))?;
@@ -97,18 +103,54 @@ impl VaultManager {
         let mut reader = BufReader::new(file);
 
         let target_entry = self.root_entry.get_entry(path.parts().into(), &path)?;
-        let mut vaultkey = self.header.retrieve_key().map_err(|e| RetrieveSecretError::RetrieveKeyError(e))?;
-        let res = target_entry.retrieve_secret(&mut reader, self.header.calculate_data_start(), &vaultkey);
+        let mut vaultkey = self
+            .header
+            .retrieve_key()
+            .map_err(|e| RetrieveSecretError::RetrieveKeyError(e))?;
+        let res = target_entry.retrieve_secret(
+            &mut reader,
+            self.header.calculate_data_start(),
+            &vaultkey,
+        );
         // Remove vaultkey from memory before returning the result
         vaultkey.zeroize();
         res
     }
 
+    fn get_encrypted_vaulttable(&self) -> Result<EncryptedData, EncryptVaultTableError> {
+        let table = self
+            .root_entry
+            .serialize_dir()
+            .map_err(|e| EncryptVaultTableError::SerializationError(e))?;
+        let mut key = self
+            .header
+            .retrieve_key()
+            .map_err(|e| EncryptVaultTableError::RetrieveKeyError(e))?;
+        let data = encrypt_dyn_region(table, &key)
+            .map_err(|e| EncryptVaultTableError::EncryptVaultError(e))?;
+        key.zeroize();
+        Ok(data)
+    }
+
     /// Writes the vault to the vault archive file
-    pub fn save_vault(&self) -> Result<(), VaultError> {
-        let file = File::open(Path::new(&self.vault_path))
-            .map_err(|e| VaultError::ReadVaultError(ReadVaultFileError::FileError(e)))?;
-        let mut writer = BufWriter::new(file);
+    pub fn save_vault(&mut self) -> Result<(), SaveVaultError> {
+        // encrypt vaulttable first as the nonce needs to be stored in the header
+        let vault_table = self
+            .get_encrypted_vaulttable()
+            .map_err(|e| SaveVaultError::EncryptVaultTableError(e))?;
+        self.header.vault_table_nonce = vault_table.nonce;
+
+        let header_data = self.header.serialize();
+        let file = OpenOptions::new()
+            .write(true)
+            .append(false)
+            .open(self.vault_path);
+        let file = File::open(self.vault_path).map_err(|e| SaveVaultError::FileError(e))?;
+        let writer = BufWriter::new(file);
+
+        // write header and vaulttable
+        writer.write(&header_data);
+        writer.write(&vault_table.data.to_vec());
     }
 
     /// Returns a list of empty data blocks in the vault archive
@@ -135,16 +177,18 @@ impl VaultManager {
             .map_err(|e| VaultChangeEntryError::InvalidVaultPath(e))?;
         let entry = self.root_entry.get_entry_mut(path.parts().into(), &path)?;
 
-        
         match entry {
             VaultEntry::Password(pwd) => {
-                let mut vault_key = self.header.retrieve_key().map_err(|e| VaultChangeEntryError::RetrieveKeyError(e))?;
+                let mut vault_key = self
+                    .header
+                    .retrieve_key()
+                    .map_err(|e| VaultChangeEntryError::RetrieveKeyError(e))?;
                 let res = pwd
-                .change_secret(&mut self.context, &vault_key, password)
-                .map_err(|e| VaultChangeEntryError::VaultChangeError(e));
+                    .change_secret(&mut self.context, &vault_key, password)
+                    .map_err(|e| VaultChangeEntryError::VaultChangeError(e));
                 vault_key.zeroize();
                 res
-            },
+            }
             VaultEntry::Directory(_) => Err(VaultChangeEntryError::InvalidOperation(
                 Operation::ChangePassword,
                 EntryType::Directory,
@@ -176,13 +220,16 @@ impl VaultManager {
                 EntryType::Directory,
             )),
             VaultEntry::Secret(sec) => {
-                let mut vault_key = self.header.retrieve_key().map_err(|e| VaultChangeEntryError::RetrieveKeyError(e))?;
+                let mut vault_key = self
+                    .header
+                    .retrieve_key()
+                    .map_err(|e| VaultChangeEntryError::RetrieveKeyError(e))?;
                 let res = sec
-                .change_secret(&mut self.context, &vault_key, secret_file_path)
-                .map_err(|e| VaultChangeEntryError::VaultChangeError(e));
+                    .change_secret(&mut self.context, &vault_key, secret_file_path)
+                    .map_err(|e| VaultChangeEntryError::VaultChangeError(e));
                 vault_key.zeroize();
                 res
-            },
+            }
         }
     }
 
@@ -218,11 +265,14 @@ impl VaultManager {
         file_path: String,
     ) -> Result<(), NewEntryError> {
         let path = VaultPath::new(parent_path).map_err(|e| NewEntryError::InvalidVaultPath(e))?;
-        let mut vault_key = self.header.retrieve_key().map_err(|e| NewEntryError::RetrieveKeyError(e))?;
-        let secret = 
-            SecretFileEntry::new(secret_name, file_path, &mut self.context, &vault_key)
-                .map_err(|e| NewEntryError::VaultChangeError(e))?;
-        let res = self.root_entry
+        let mut vault_key = self
+            .header
+            .retrieve_key()
+            .map_err(|e| NewEntryError::RetrieveKeyError(e))?;
+        let secret = SecretFileEntry::new(secret_name, file_path, &mut self.context, &vault_key)
+            .map_err(|e| NewEntryError::VaultChangeError(e))?;
+        let res = self
+            .root_entry
             .new_entry(path.parts().into(), &path, VaultEntry::Secret(secret))
             .map_err(|e| NewEntryError::VaultError(e));
         vault_key.zeroize();
@@ -237,12 +287,15 @@ impl VaultManager {
     ) -> Result<(), NewEntryError> {
         let path = VaultPath::new(parent_path).map_err(|e| NewEntryError::InvalidVaultPath(e))?;
 
-        let mut vault_key = self.header.retrieve_key().map_err(|e| NewEntryError::RetrieveKeyError(e))?;
-        let password =
-            PasswordEntry::new(password_name, password, &mut self.context, &vault_key)
-                .map_err(|e| NewEntryError::VaultChangeError(e))?;
+        let mut vault_key = self
+            .header
+            .retrieve_key()
+            .map_err(|e| NewEntryError::RetrieveKeyError(e))?;
+        let password = PasswordEntry::new(password_name, password, &mut self.context, &vault_key)
+            .map_err(|e| NewEntryError::VaultChangeError(e))?;
 
-        let res = self.root_entry
+        let res = self
+            .root_entry
             .new_entry(path.parts().into(), &path, VaultEntry::Password(password))
             .map_err(|e| NewEntryError::VaultError(e));
         vault_key.zeroize();
@@ -251,10 +304,17 @@ impl VaultManager {
 }
 
 #[derive(Debug)]
-pub struct DataBlockChange {
-    start: u64,
-    len: usize,
-    data: Option<Bytes>,
+pub enum DataBlockChange {
+    ChangeBlock {
+        start: u64,
+        len: usize,
+        data: Bytes,
+    },
+    ChangeNext(i64),
+    Zeroize {
+        start: u64, 
+        len: usize,
+    }
 }
 
 impl DataBlockChange {
@@ -318,12 +378,15 @@ impl HeaderInfo {
 
     /// Get the key encrypted in the header using the supplied password. Uses pbkdf2_hmac to
     /// generate a key which is then used to decrypt the vault master key
-    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError>{
+    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
         let mut pwd: String = String::new();
-        stdin().read_line(&mut pwd).map_err(|e| RetrieveKeyError::StdinError(e))?;
+        stdin()
+            .read_line(&mut pwd)
+            .map_err(|e| RetrieveKeyError::StdinError(e))?;
 
         let user_key = generate_user_key(pwd, &self.userkey_iv);
-        let vault_key = decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
+        let vault_key =
+            decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
         vault_key.map_err(|e| RetrieveKeyError::DecryptError(e))
     }
 
@@ -416,7 +479,9 @@ fn read_vault_table(
     //the vault table. Each entry is 157 bytes long.
     let vault_table = read_dyn_field(reader, header.vault_table_size as usize * VAULTENTRY_LENGTH)
         .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-    let mut vault_key = header.retrieve_key().map_err(|e| ReadVaultFileError::RetrieveKeyError(e))?;
+    let mut vault_key = header
+        .retrieve_key()
+        .map_err(|e| ReadVaultFileError::RetrieveKeyError(e))?;
     let table = decrypt_region_dyn(vault_table, &header.vault_table_nonce, &vault_key)
         .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
     // Immediately wipe the master vault key from memory to avoid possible core-dump attacks
