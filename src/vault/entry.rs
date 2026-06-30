@@ -6,7 +6,7 @@ use std::{
     vec::IntoIter,
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
     crypt::{AES_NONCE_LENGTH, EncryptFileError, decrypt_region, encrypt_file, encrypt_region},
@@ -29,8 +29,9 @@ const V_CONNECTOR: &str = "│\t";
 const LITERAL: &str = "├─ ";
 const END_LITERAL: &str = "└ ";
 
-const PWDENTRY_ENC_LENGTH: usize =
-    VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + AES_NONCE_LENGTH + AES_GCM_AUTH_TAG;
+const PWDENTRY_ENC_LENGTH: usize = VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + AES_NONCE_LENGTH;
+const SECENTRY_ENC_LENGTH: usize =
+    VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + SECRET_SIZE_LENGTH + AES_NONCE_LENGTH;
 
 /// An Enum representing the result of an entry secret retrieval
 pub enum EntryResult {
@@ -75,7 +76,11 @@ pub trait Entry {
     fn display(&self) -> String;
     /// Serializes the entry into an array that fits inside a datablock
     fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError>;
-    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    fn build_entry(
+        data: [u8; VAULTENTRY_LENGTH],
+        key: &[u8],
+        entry_block: u64,
+    ) -> Result<(u64, Self), ReadVaultFileError>
     where
         Self: Sized;
     fn rename(
@@ -83,18 +88,20 @@ pub trait Entry {
         new_name: String,
         key: &[u8],
         context: &mut VaultChangeContext,
-    ) -> Result<(), NameLengthExceededError>;
+    ) -> Result<(), RenameError>;
     fn occupied_datablocks(&self) -> BlockSet;
 }
 
 /// Entry that holds a password
 /// The entry follows the following structure in the file (differs from in memory significantly):
-/// Nonce - The nonce for the direntry block
 /// Type - The type of the directory entry (u8)
+/// Nonce - The nonce for the direntry block ([u8, 12])
 /// Name - Name of the directory entry ([u8, 128])
 /// Next - index of the next directory entry block (i64)
-/// block - Block Id of the password block (i64)
-/// block_nonce - Nonce of the password block ([u8, 16])
+/// block - Block Id of the password block (u64)
+/// block_nonce - Nonce of the password block ([u8, 12])
+/// auth tag - Authentication tag of the encrypted fields (everything is encrypted except type and
+/// nonce) ([u8; 12])
 #[derive(Debug, PartialEq, Eq)]
 pub struct PasswordEntry {
     /// Name of the password
@@ -165,16 +172,16 @@ impl EncryptedEntry<String, String> for PasswordEntry {
 
         // Push DataBlock first and password entry block after
         context.changes.push(DataBlockChange::ChangeBlock {
-            start: pwd_block.start,
-            len: pwd_block.len(),
+            start: entry.pwd_block,
+            len: 1,
             data: Bytes::copy_from_slice(&enc_data.data),
         });
         let serialized_entry = entry
             .serialize(key)
             .map_err(|e| VaultChangeError::SerializeError(e))?;
         context.changes.push(DataBlockChange::ChangeBlock {
-            start: entry_block.start,
-            len: entry_block.len(),
+            start: entry.block,
+            len: 1,
             data: Bytes::copy_from_slice(&serialized_entry),
         });
         Ok(entry)
@@ -271,6 +278,7 @@ impl Entry for PasswordEntry {
     fn build_entry(
         data: [u8; VAULTENTRY_LENGTH],
         key: &[u8],
+        entry_block: u64,
     ) -> Result<(u64, Self), ReadVaultFileError>
     where
         Self: Sized,
@@ -283,28 +291,45 @@ impl Entry for PasswordEntry {
         let nonce: &[u8; AES_NONCE_LENGTH] =
             &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
         offset += AES_NONCE_LENGTH;
-        let entry_data = decrypt_region(
+        let entry_data: [u8; PWDENTRY_ENC_LENGTH - AES_GCM_AUTH_TAG] = decrypt_region(
             &data[offset..offset + PWDENTRY_ENC_LENGTH]
                 .try_into()
                 .unwrap(),
             nonce,
             key,
-        );
-        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+        )
+        .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
+
+        offset = 0;
+        // Get the decrypted fields and build struct
+        // use a BytesMut buffer because the converted string does not have the same length
+        let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        //check if name is valid utf8
+        let name = String::from_utf8(entry_data[offset..offset + VAULTENTRYNAME_LENGTH].to_vec())
             .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
-        // Because array of Copy types are copied when doing a slice this does not consume the
-        // entry_data array
-        let blk_id = u64::from_ne_bytes(data[offset..offset + BLOCKID_LENGTH].try_into().unwrap());
+        namebuffer.put_slice(name.as_bytes());
+
+        let mut next_blk_buf = [0u8; BLOCKID_LENGTH];
+        next_blk_buf.copy_from_slice(&entry_data[offset..offset + BLOCKID_LENGTH]);
+        let next_blk = i64::from_be_bytes(next_blk_buf);
         offset += BLOCKID_LENGTH;
-        let nonce: [u8; AES_NONCE_LENGTH] =
-            data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+
+        let mut pwd_blk_buf = [0u8; BLOCKID_LENGTH];
+        pwd_blk_buf.copy_from_slice(&entry_data[offset..offset + BLOCKID_LENGTH]);
+        let pwd_blk_id = u64::from_ne_bytes(pwd_blk_buf);
+        offset += BLOCKID_LENGTH;
+
+        let mut pwd_nonce_buf = [0u8; AES_NONCE_LENGTH];
+        pwd_nonce_buf.copy_from_slice(&entry_data[offset..offset + BLOCKID_LENGTH]);
         Ok((
             0,
             PasswordEntry {
-                password_name: name,
-                secret_block_id: blk_id,
-                nonce,
+                name: *namebuffer.freeze().as_array().unwrap(),
+                block: entry_block,
+                next: next_blk,
+                pwd_block: pwd_blk_id,
+                pwd_block_nonce: pwd_nonce_buf,
             },
         ))
     }
@@ -312,16 +337,32 @@ impl Entry for PasswordEntry {
 
 /// Entry for an encrypted Secret File (like a recovery key or a keyfile, or any other kind of file
 /// that needs to be kept secure)
+/// Structure of the SecretFileEntry in the vault archive file
+/// Type - Type of entry (u8)
+/// Nonce - Nonce used for encryption of the block entry ([u8; 12])
+/// Name - Name of the entry ([u8; 128])
+/// Next - Next block in directory order (i64)
+/// SecretStart - Block Id of the starting block (u64)
+/// SecretSize - Nr of Blocks that belong to the block (u64)
+/// SecretNonce - Nonce for the block encryption ([u8; 12])
+/// auth tag - Authentication tag of the encrypted fields (everything is encrypted except type and
+/// nonce)
+///
+/// The secret block is a continuous block in memory that is encrypted in its entirety
 #[derive(Debug, PartialEq, Eq)]
 pub struct SecretFileEntry {
+    /// Id of the block containing the entry
+    block: u64,
     /// Name of the secret
-    secret_name: String,
-    /// Id of the starting secret block
-    pub secret_block_id: u64,
-    /// Length of the secret file
-    pub size: u64,
-    /// Nonce used for decryption of the datablocks
-    pub nonce: [u8; AES_NONCE_LENGTH],
+    name: [u8; VAULTENTRYNAME_LENGTH],
+    /// Id of the next directory entry block in the directory
+    next: i64,
+    /// Block Id of the starting block
+    start: u64,
+    /// Nr of blocks that make up the secret
+    size: u64,
+    /// Nonce used for encryption of the block
+    nonce: [u8; AES_NONCE_LENGTH],
 }
 
 impl EncryptedEntry<String, Bytes> for SecretFileEntry {
@@ -331,7 +372,7 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
         data_start: u64,
         key: &[u8],
     ) -> Result<Bytes, RetrieveSecretError> {
-        let data_start = data_start + self.secret_block_id * DATABLOCK_LENGTH as u64;
+        let data_start = data_start + self.start * DATABLOCK_LENGTH as u64;
         let data = read_dyn_data_block(
             reader,
             data_start,
@@ -357,21 +398,36 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
             EncryptFileError::CryptoError(e) => VaultChangeError::CryptographyError(e),
             EncryptFileError::FileError(e) => VaultChangeError::FileError(e),
         })?;
-        let block = context
+        let entry_block = context.empty_blocks.occupy(1);
+        let secret_block = context
             .empty_blocks
             .occupy(data.data.len() / DATABLOCK_LENGTH);
+
+        let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        namebuffer.put_slice(name.as_bytes());
+
         let entry = SecretFileEntry {
-            secret_name: name,
-            secret_block_id: block.start,
-            size: block.len() as u64,
+            block: entry_block.start,
+            name: *namebuffer.freeze().as_array().unwrap(),
+            next: -1,
+            start: secret_block.start,
+            size: secret_block.len() as u64,
             nonce: data.nonce,
         };
 
-        context.changes.push(DataBlockChange::new(
-            block.start,
-            block.len(),
-            Some(data.data),
-        ));
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: entry.start,
+            len: entry.size as usize,
+            data: data.data,
+        });
+        let entry_data = entry
+            .serialize(key)
+            .map_err(|e| VaultChangeError::SerializeError(e))?;
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: entry.block,
+            len: 1,
+            data: Bytes::copy_from_slice(&entry_data),
+        });
         Ok(entry)
     }
 
@@ -390,7 +446,7 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
 
         if block_len > self.size {
             //mark empty and occupy new
-            let curr_block = BlockRange::new(self.secret_block_id, self.size as usize);
+            let curr_block = BlockRange::new(self.start, self.size as usize);
             context.changes.push(DataBlockChange::new(
                 curr_block.start,
                 curr_block.len(),
@@ -399,35 +455,53 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
             context.empty_blocks.put(curr_block);
 
             let new_block = context.empty_blocks.occupy(block_len as usize);
-            context.changes.push(DataBlockChange::new(
-                new_block.start,
-                new_block.len(),
-                Some(data.data),
-            ));
-            self.secret_block_id = new_block.start;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: new_block.start,
+                len: new_block.len(),
+                data: data.data,
+            });
+
+            self.start = new_block.start;
             self.size = new_block.len() as u64;
+            let new_entry = self
+                .serialize(key)
+                .map_err(|e| VaultChangeError::SerializeError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&new_entry),
+            });
         } else if block_len == self.size {
             //replace in place
-            context.changes.push(DataBlockChange::new(
-                self.secret_block_id,
-                self.size as usize,
-                Some(data.data),
-            ));
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.start,
+                len: self.size as usize,
+                data: data.data,
+            });
         } else {
             //shrink
             let diff = self.size - block_len;
-            let empty_block = BlockRange::new(self.secret_block_id + block_len, diff as usize);
-            context.changes.push(DataBlockChange::new(
-                empty_block.start,
-                empty_block.len(),
-                None,
-            ));
+            let empty_block = BlockRange::new(self.start + block_len, diff as usize);
+            self.size = block_len;
+            context.changes.push(DataBlockChange::Zeroize {
+                start: empty_block.start,
+                len: empty_block.len(),
+            });
             context.empty_blocks.put(empty_block);
-            context.changes.push(DataBlockChange::new(
-                self.secret_block_id,
-                block_len as usize,
-                Some(data.data),
-            ));
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.start,
+                len: self.size as usize,
+                data: data.data,
+            });
+
+            let new_entry = self
+                .serialize(key)
+                .map_err(|e| VaultChangeError::SerializeError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&new_entry),
+            });
         }
         Ok(())
     }
@@ -435,17 +509,25 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
 
 impl Entry for SecretFileEntry {
     fn display(&self) -> String {
-        format!("{} (File)", self.secret_name)
+        format!("{} (File)", String::from_utf8(self.name.to_vec()).unwrap())
     }
 
-    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], SerializationError> {
-        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
+    fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError> {
+        let mut enc_bytes = BytesMut::zeroed(SECENTRY_ENC_LENGTH);
+        enc_bytes.put_slice(&self.name);
+        enc_bytes.put_i64(self.next);
+        enc_bytes.put_u64(self.start);
+        enc_bytes.put_u64(self.size);
+        enc_bytes.put_slice(&self.nonce);
+
+        let data = encrypt_region(enc_bytes.freeze().as_array::<SECENTRY_ENC_LENGTH>().unwrap(), key)
+            .map_err(|e| SerializationError::EncryptError(e))?;
+
+        let mut bytes: BytesMut = BytesMut::zeroed(DATABLOCK_LENGTH);
         bytes.put_u8(SECRETENTRY_TYPE);
-        bytes.put(self.secret_name.as_bytes());
-        bytes.put_u64(self.secret_block_id);
-        bytes.put_u64(self.size);
-        bytes.put(&self.nonce[..]);
-        match bytes.as_array::<VAULTENTRY_LENGTH>() {
+        bytes.put_slice(&data.nonce);
+        bytes.put_slice(&data.data);
+        match bytes.as_array::<DATABLOCK_LENGTH>() {
             Some(e) => Ok(e.to_owned()),
             None => Err(SerializationError::InvalidLength),
         }
@@ -510,12 +592,6 @@ pub struct DirectoryEntry {
     /// secret lookups
     children: HashMap<String, VaultEntry>,
     block: DirectoryEntryBlock,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct DirectoryEntryBlock {
-    next_entry: Option<u64>,
-    first_child: Option<u64>,
 }
 
 impl PartialEq for DirectoryEntry {
