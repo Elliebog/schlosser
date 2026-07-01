@@ -117,21 +117,6 @@ impl VaultManager {
         res
     }
 
-    fn get_encrypted_vaulttable(&self) -> Result<EncryptedData, EncryptVaultTableError> {
-        let table = self
-            .root_entry
-            .serialize_dir()
-            .map_err(|e| EncryptVaultTableError::SerializationError(e))?;
-        let mut key = self
-            .header
-            .retrieve_key()
-            .map_err(|e| EncryptVaultTableError::RetrieveKeyError(e))?;
-        let data = encrypt_dyn_region(table, &key)
-            .map_err(|e| EncryptVaultTableError::EncryptVaultError(e))?;
-        key.zeroize();
-        Ok(data)
-    }
-
     /// Writes the vault to the vault archive file
     pub fn save_vault(&mut self) -> Result<(), SaveVaultError> {
         // encrypt vaulttable first as the nonce needs to be stored in the header

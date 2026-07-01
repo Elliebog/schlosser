@@ -130,7 +130,8 @@ pub enum VaultChangeError {
     FileError(std::io::Error),
     CryptographyError(CryptographyError),
     ExceededNameLength(NameLengthExceededError),
-    SerializeError(SerializationError)
+    SerializeError(SerializationError),
+    VaultError(VaultError)
 }
 
 impl From<CryptographyError> for VaultChangeError {

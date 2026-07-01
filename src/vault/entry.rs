@@ -32,6 +32,7 @@ const END_LITERAL: &str = "└ ";
 const PWDENTRY_ENC_LENGTH: usize = VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + AES_NONCE_LENGTH;
 const SECENTRY_ENC_LENGTH: usize =
     VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2 + SECRET_SIZE_LENGTH + AES_NONCE_LENGTH;
+const DIRENTRY_ENC_LENGTH: usize = VAULTENTRYNAME_LENGTH + BLOCKID_LENGTH * 2;
 
 /// An Enum representing the result of an entry secret retrieval
 pub enum EntryResult {
@@ -80,7 +81,7 @@ pub trait Entry {
         data: [u8; VAULTENTRY_LENGTH],
         key: &[u8],
         entry_block: u64,
-    ) -> Result<(u64, Self), ReadVaultFileError>
+    ) -> Result<Self, ReadVaultFileError>
     where
         Self: Sized;
     fn rename(
@@ -90,6 +91,13 @@ pub trait Entry {
         context: &mut VaultChangeContext,
     ) -> Result<(), RenameError>;
     fn occupied_datablocks(&self) -> BlockSet;
+    fn entry_datablock(&self) -> u64;
+    fn change_next(
+        &mut self,
+        next_blk: i64,
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), SerializationError>;
 }
 
 /// Entry that holds a password
@@ -123,9 +131,6 @@ impl EncryptedEntry<String, String> for PasswordEntry {
         data_start: u64,
         key: &[u8],
     ) -> Result<String, RetrieveSecretError> {
-        if self.pwd_block > 0 {
-            return Err(RetrieveSecretError::InvalidDataBlockError(self.pwd_block));
-        }
         // Overflow cannot happen as the cap on u64 is so high it will never be reached
         let datablock_offset = data_start + self.pwd_block as u64 * DATABLOCK_LENGTH as u64;
         let data = read_data_block(reader, datablock_offset, key, &self.pwd_block_nonce)?;
@@ -279,7 +284,7 @@ impl Entry for PasswordEntry {
         data: [u8; VAULTENTRY_LENGTH],
         key: &[u8],
         entry_block: u64,
-    ) -> Result<(u64, Self), ReadVaultFileError>
+    ) -> Result<Self, ReadVaultFileError>
     where
         Self: Sized,
     {
@@ -322,16 +327,32 @@ impl Entry for PasswordEntry {
 
         let mut pwd_nonce_buf = [0u8; AES_NONCE_LENGTH];
         pwd_nonce_buf.copy_from_slice(&entry_data[offset..offset + BLOCKID_LENGTH]);
-        Ok((
-            0,
-            PasswordEntry {
-                name: *namebuffer.freeze().as_array().unwrap(),
-                block: entry_block,
-                next: next_blk,
-                pwd_block: pwd_blk_id,
-                pwd_block_nonce: pwd_nonce_buf,
-            },
-        ))
+        Ok(PasswordEntry {
+            name: *namebuffer.freeze().as_array().unwrap(),
+            block: entry_block,
+            next: next_blk,
+            pwd_block: pwd_blk_id,
+            pwd_block_nonce: pwd_nonce_buf,
+        })
+    }
+    fn entry_datablock(&self) -> u64 {
+        self.block
+    }
+
+    fn change_next(
+        &mut self,
+        next_blk: i64,
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), SerializationError> {
+        self.next = next_blk;
+        let entry = self.serialize(key)?;
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: self.block,
+            len: 1,
+            data: Bytes::copy_from_slice(&entry),
+        });
+        Ok(())
     }
 }
 
@@ -520,8 +541,14 @@ impl Entry for SecretFileEntry {
         enc_bytes.put_u64(self.size);
         enc_bytes.put_slice(&self.nonce);
 
-        let data = encrypt_region(enc_bytes.freeze().as_array::<SECENTRY_ENC_LENGTH>().unwrap(), key)
-            .map_err(|e| SerializationError::EncryptError(e))?;
+        let data = encrypt_region(
+            enc_bytes
+                .freeze()
+                .as_array::<SECENTRY_ENC_LENGTH>()
+                .unwrap(),
+            key,
+        )
+        .map_err(|e| SerializationError::EncryptError(e))?;
 
         let mut bytes: BytesMut = BytesMut::zeroed(DATABLOCK_LENGTH);
         bytes.put_u8(SECRETENTRY_TYPE);
@@ -533,180 +560,314 @@ impl Entry for SecretFileEntry {
         }
     }
 
-    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    fn build_entry(
+        data: [u8; VAULTENTRY_LENGTH],
+        key: &[u8],
+        entry_block: u64,
+    ) -> Result<Self, ReadVaultFileError>
     where
         Self: Sized,
     {
         //Secret File Entry
         let mut offset = 1;
-        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+
+        let nonce = &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+        offset += AES_NONCE_LENGTH;
+        let enc_data = &data[offset..offset + SECENTRY_ENC_LENGTH + AES_GCM_AUTH_TAG]
+            .try_into()
+            .unwrap();
+        let entry = decrypt_region(enc_data, nonce, key)
+            .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
+
+        offset = 0;
+        let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        // make sure it is valid utf8
+        let name = String::from_utf8(entry[offset..offset + VAULTENTRY_LENGTH].to_vec())
             .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+        namebuf.put_slice(name.as_bytes());
         offset += VAULTENTRYNAME_LENGTH;
-        // Because array of Copy types are copied when doing a slice this does not consume the
-        // entry_data array
-        let blk_id = u64::from_ne_bytes(data[offset..offset + BLOCKID_LENGTH].try_into().unwrap());
+
+        let mut next_buf = [0u8; BLOCKID_LENGTH];
+        next_buf.copy_from_slice(&entry[offset..offset + BLOCKID_LENGTH]);
+        let next_blk = i64::from_be_bytes(next_buf);
         offset += BLOCKID_LENGTH;
-        let size = u64::from_ne_bytes(
-            data[offset..offset + SECRET_SIZE_LENGTH]
-                .try_into()
-                .unwrap(),
-        );
-        offset += SECRET_SIZE_LENGTH;
-        let nonce: [u8; AES_NONCE_LENGTH] =
-            data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
-        Ok((
-            0,
-            SecretFileEntry {
-                secret_name: name,
-                secret_block_id: blk_id,
-                size,
-                nonce,
-            },
-        ))
+
+        let mut start_buf = [0u8; BLOCKID_LENGTH];
+        start_buf.copy_from_slice(&entry[offset..offset + BLOCKID_LENGTH]);
+        let start_blk = u64::from_be_bytes(start_buf);
+        offset += BLOCKID_LENGTH;
+
+        let mut size_buf = [0u8; BLOCKID_LENGTH];
+        size_buf.copy_from_slice(&entry[offset..offset + BLOCKID_LENGTH]);
+        let blk_size = u64::from_be_bytes(size_buf);
+        offset += BLOCKID_LENGTH;
+
+        let mut nonce_buf = [0u8; AES_NONCE_LENGTH];
+        nonce_buf.copy_from_slice(&entry[offset..offset + AES_NONCE_LENGTH]);
+
+        Ok(SecretFileEntry {
+            name: *namebuf.freeze().as_array().unwrap(),
+            block: entry_block,
+            next: next_blk,
+            start: start_blk,
+            size: blk_size,
+            nonce: nonce_buf,
+        })
     }
 
-    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+    fn rename(
+        &mut self,
+        new_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
-            Err(NameLengthExceededError {
+            Err(RenameError::NameError(NameLengthExceededError {
                 len: new_name.len(),
-            })
+            }))
         } else {
-            self.secret_name = new_name;
+            //convert name to u8 buffer
+            let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+            namebuffer.put(new_name.as_bytes());
+            let buffer = namebuffer.freeze();
+
+            self.name = *buffer.as_array().unwrap();
+            let data = self
+                .serialize(key)
+                .map_err(|e| RenameError::SerializationError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&data),
+            });
             Ok(())
         }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
         let mut blocks = BlockSet::new();
-        blocks.put(BlockRange::new(self.secret_block_id, self.size as usize));
+        blocks.put(BlockRange::new(self.start, self.size as usize));
+        blocks.put(BlockRange::new(self.block, 1));
         blocks
+    }
+    fn entry_datablock(&self) -> u64 {
+        self.block
+    }
+    fn change_next(
+        &mut self,
+        next_blk: i64,
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), SerializationError> {
+        self.next = next_blk;
+        let entry = self.serialize(key)?;
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: self.block,
+            len: 1,
+            data: Bytes::copy_from_slice(&entry),
+        });
+        Ok(())
     }
 }
 
 /// Entry that represents a directory in the vault structure
-#[derive(Debug)]
+/// Structure in vault archive:
+/// Type - Type of the entry (u8)
+/// Nonce - Nonce for the entry encryption ([u8; 12])
+/// Name - Name of the directory ([u8; 128])
+/// Next - next entry in directory order (i64)
+/// child - First Child Block (i64)
+/// auth_tag - Authentication tag for the encryption ([u8; 16])
+///
+/// The directory holds the entries aas its children in an array
+/// it is indexed by a hashmap
+#[derive(Debug, PartialEq, Eq)]
 pub struct DirectoryEntry {
     /// Name of the directory
-    pub directory_name: String,
-    /// Entries that are in the directory. A Hashmap is used to facilitate faster password and
-    /// secret lookups
-    children: HashMap<String, VaultEntry>,
-    block: DirectoryEntryBlock,
+    pub name: [u8; VAULTENTRYNAME_LENGTH],
+    /// Block the entry resides in
+    block: u64,
+    /// Block of the next entry
+    next: i64,
+    /// Block of the first child
+    first_child: i64,
+    children: Vec<VaultEntry>,
+    map: HashMap<String, usize>,
 }
-
-impl PartialEq for DirectoryEntry {
-    fn eq(&self, other: &Self) -> bool {
-        if self.directory_name != self.directory_name {
-            return false;
-        }
-        let other_values: Vec<&VaultEntry> = other.children.values().collect();
-        let self_values: Vec<&VaultEntry> = self.children.values().collect();
-        other_values == self_values && self.block == other.block
-    }
-}
-impl Eq for DirectoryEntry {}
 
 impl Entry for DirectoryEntry {
     fn display(&self) -> String {
-        format!("{}: {} Items", self.directory_name, self.children.len())
+        format!(
+            "{}: {} Items",
+            String::from_utf8(self.name.to_vec()).unwrap(),
+            self.children.len()
+        )
     }
 
-    fn serialize(&self) -> Result<[u8; VAULTENTRY_LENGTH], SerializationError> {
-        let mut bytes: BytesMut = BytesMut::zeroed(VAULTENTRY_LENGTH);
-        bytes.put_u8(DIRENTRY_TYPE);
-        bytes.put(self.directory_name.as_bytes());
-        bytes.put_u64(self.children.len() as u64);
-        match bytes.as_array::<VAULTENTRY_LENGTH>() {
-            Some(e) => Ok(e.to_owned()),
-            None => Err(SerializationError::InvalidLength),
-        }
+    fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError> {
+        let mut bytes = BytesMut::zeroed(DIRENTRY_ENC_LENGTH);
+        bytes.put_slice(&self.name);
+        bytes.put_i64(self.next);
+        bytes.put_i64(self.first_child);
+
+        let enc_entry =
+            encrypt_region::<DIRENTRY_ENC_LENGTH>(bytes.freeze().as_array().unwrap(), key)
+                .map_err(|e| SerializationError::EncryptError(e))?;
+
+        let mut data = BytesMut::zeroed(DATABLOCK_LENGTH);
+        data.put_u8(DIRENTRY_TYPE);
+        data.put_slice(&enc_entry.nonce);
+        data.put_slice(&enc_entry.data);
+
+        Ok(*data.freeze().as_array().unwrap())
     }
 
-    fn build_entry(data: [u8; VAULTENTRY_LENGTH]) -> Result<(u64, Self), ReadVaultFileError>
+    fn build_entry(
+        data: [u8; VAULTENTRY_LENGTH],
+        key: &[u8],
+        entry_block: u64,
+    ) -> Result<Self, ReadVaultFileError>
     where
         Self: Sized,
     {
         // Directory Entry
         let mut offset: usize = 1;
-        let name = String::from_utf8(data[offset..offset + VAULTENTRY_LENGTH].to_vec())
+
+        let nonce = &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
+        offset += AES_NONCE_LENGTH;
+        let enc_data = &data[offset..offset + DIRENTRY_ENC_LENGTH]
+            .try_into()
+            .unwrap();
+        let entry = decrypt_region::<PWDENTRY_ENC_LENGTH>(enc_data, nonce, key)
+            .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
+
+        let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        offset = 0;
+        let name = String::from_utf8(entry[offset..offset + VAULTENTRY_LENGTH].to_vec())
             .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
+        namebuf.put_slice(name.as_bytes());
 
-        // Because array of Copy types are copied when doing a slice this does not consume the
-        // entry_data array
-        let size = u64::from_ne_bytes(
-            data[offset..offset + DIRENTRY_SIZE_LENGTH]
-                .try_into()
-                .unwrap(),
-        );
-        Ok((
-            size,
-            DirectoryEntry {
-                directory_name: name,
-                children: HashMap::new(),
-            },
-        ))
+        let mut next_buf = [0u8; BLOCKID_LENGTH];
+        next_buf.copy_from_slice(&entry[offset..offset + BLOCKID_LENGTH]);
+        let nextblk = i64::from_be_bytes(next_buf);
+        offset += BLOCKID_LENGTH;
+
+        let mut child_buf = [0u8; BLOCKID_LENGTH];
+        child_buf.copy_from_slice(&entry[offset..offset + BLOCKID_LENGTH]);
+        let child = i64::from_be_bytes(child_buf);
+
+        Ok(DirectoryEntry {
+            name: *namebuf.freeze().as_array().unwrap(),
+            block: entry_block,
+            next: nextblk,
+            first_child: child,
+            children: Vec::new(),
+            map: HashMap::new(),
+        })
     }
 
-    fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+    fn rename(
+        &mut self,
+        new_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
-            Err(NameLengthExceededError {
+            Err(RenameError::NameError(NameLengthExceededError {
                 len: new_name.len(),
-            })
+            }))
         } else {
-            self.directory_name = new_name;
+            let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+            namebuf.put_slice(new_name.as_bytes());
+            self.name = *namebuf.freeze().as_array().unwrap();
+
+            let new_entry = self
+                .serialize(key)
+                .map_err(|e| RenameError::SerializationError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: self.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&new_entry),
+            });
+
             Ok(())
         }
     }
 
     fn occupied_datablocks(&self) -> BlockSet {
         let mut blocks = BlockSet::new();
-        for entry in self.children.values() {
+        for entry in &self.children {
             entry
                 .occupied_blocks()
                 .into_iter()
                 .for_each(|b| blocks.put(b));
         }
+        blocks.put(BlockRange::new(self.block, 1));
         blocks
+    }
+    fn entry_datablock(&self) -> u64 {
+        self.block
+    }
+    fn change_next(
+        &mut self,
+        next_blk: i64,
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), SerializationError> {
+        self.next = next_blk;
+        let entry = self.serialize(key)?;
+        context.changes.push(DataBlockChange::ChangeBlock {
+            start: self.block,
+            len: 1,
+            data: Bytes::copy_from_slice(&entry),
+        });
+        Ok(())
     }
 }
 
 impl DirectoryEntry {
-    pub fn new(dir_name: String) -> Result<Self, NameLengthExceededError> {
+    pub fn new(
+        dir_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<Self, VaultChangeError> {
         if dir_name.len() > VAULTNAME_LENGTH {
-            Err(NameLengthExceededError {
-                len: dir_name.len(),
-            })
+            Err(VaultChangeError::ExceededNameLength(
+                NameLengthExceededError {
+                    len: dir_name.len(),
+                },
+            ))
         } else {
-            Ok(DirectoryEntry {
-                children: HashMap::new(),
-                directory_name: dir_name,
-            })
-        }
-    }
+            let entry_block = context.empty_blocks.occupy(1);
+            let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+            namebuf.put_slice(dir_name.as_bytes());
 
-    pub fn serialize_dir(&self) -> Result<Bytes, SerializationError> {
-        let mut bytes = BytesMut::with_capacity(VAULTENTRY_LENGTH * self.children.len());
-        // Serialize self
-        bytes.put_slice(&self.serialize()?);
-        for entry in self.children.values() {
-            if let VaultEntry::Directory(dir) = entry {
-                let subdir_bytes = dir.serialize_dir()?;
-                // bytes only has space for self.children.len() amount of vault entries -> Reserve
-                // space for sub-directory contents.
-                // serialize_dir includes the directory entry and not just the subdirectory contents
-                // -> but the space for directory entry exists -> only reserve subdir content bytes
-                bytes.reserve(subdir_bytes.len() - VAULTENTRY_LENGTH);
-                bytes.put(subdir_bytes);
-            } else {
-                bytes.put_slice(&entry.serialize()?);
-            }
+            let entry = DirectoryEntry {
+                name: *namebuf.freeze().as_array().unwrap(),
+                block: entry_block.start,
+                next: -1,
+                first_child: -1,
+                children: Vec::new(),
+                map: HashMap::new(),
+            };
+
+            let serialized_entry = entry
+                .serialize(key)
+                .map_err(|e| VaultChangeError::SerializeError(e))?;
+            context.changes.push(DataBlockChange::ChangeBlock {
+                start: entry.block,
+                len: 1,
+                data: Bytes::copy_from_slice(&serialized_entry),
+            });
+
+            Ok(entry)
         }
-        Ok(bytes.freeze())
     }
 
     pub fn get_sorted_children(&self) -> Vec<&VaultEntry> {
-        let mut entries: Vec<&VaultEntry> = self.children.values().collect();
+        let mut entries: Vec<&VaultEntry> = Vec::new();
+        self.children.iter().for_each(|e| entries.push(&e));
         entries.sort();
         entries
     }
@@ -747,8 +908,8 @@ impl DirectoryEntry {
         Ok(())
     }
 
-    pub fn get_children(&self) -> Vec<&VaultEntry> {
-        self.children.values().collect()
+    pub fn get_children(&self) -> &Vec<VaultEntry> {
+        &self.children
     }
 
     pub fn sorted_iter(&self) -> IntoIter<&VaultEntry> {
@@ -788,10 +949,11 @@ impl DirectoryEntry {
             None => Err(VaultError::EntryNotFound(total_path.clone())),
             Some(n) => Ok(n),
         }?;
-        let entry = match self.children.get(name) {
+        let child_id = match self.map.get(name) {
             None => Err(VaultError::EntryNotFound(total_path.clone())),
             Some(e) => Ok(e),
         }?;
+        let entry = &self.children[child_id.clone()];
 
         if path.is_empty() {
             Ok(entry)
@@ -811,10 +973,11 @@ impl DirectoryEntry {
             None => Err(VaultError::EntryNotFound(total_path.clone())),
             Some(n) => Ok(n),
         }?;
-        let entry = match self.children.get_mut(name) {
+        let child_id = match self.map.get(name) {
             None => Err(VaultError::EntryNotFound(total_path.clone())),
             Some(e) => Ok(e),
         }?;
+        let entry = &mut self.children[child_id.clone()];
 
         if path.is_empty() {
             Ok(entry)
@@ -833,40 +996,54 @@ impl DirectoryEntry {
         mut path: VecDeque<&str>,
         total_path: &VaultPath,
         new_name: String,
-    ) -> Result<(), VaultError> {
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), VaultChangeError> {
         // pop next name
         let name = match path.pop_front() {
-            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            None => Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            ))),
             Some(n) => Ok(n),
         }?;
 
-        if !self.children.contains_key(name) {
-            return Err(VaultError::EntryNotFound(total_path.clone()));
+        if !self.map.contains_key(name) {
+            return Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            )));
         };
 
         if path.is_empty() {
             //Check if name conforms with name length restrictions
             if new_name.len() > VAULTNAME_LENGTH {
-                return Err(VaultError::NameError(NameLengthExceededError {
-                    len: new_name.len(),
-                }));
+                return Err(VaultChangeError::VaultError(VaultError::NameError(
+                    NameLengthExceededError {
+                        len: new_name.len(),
+                    },
+                )));
             }
 
-            if self.children.contains_key(&new_name) {
-                Err(VaultError::DuplicateEntry(new_name.clone()))
+            if self.map.contains_key(&new_name) {
+                Err(VaultChangeError::VaultError(VaultError::DuplicateEntry(
+                    new_name.clone(),
+                )))
             } else {
                 // Verified already that it exists. can unwrap
-                let mut new_entry = self.children.remove(name).unwrap();
-                // Rename always succeeds because we check it earlier to avoid ugly interactions
-                // with remove
-                new_entry.rename(new_name.clone());
-                self.children.insert(new_name, new_entry);
+                let index = self.map.get(&new_name).unwrap().clone();
+                let entry = &mut self.children[index.clone()];
+                entry.rename(new_name.clone(), key, context);
+                self.map.remove(name);
+                self.map.insert(new_name, index);
                 Ok(())
             }
-        } else if let VaultEntry::Directory(dir) = self.children.get_mut(name).as_mut().unwrap() {
-            dir.rename_entry(path, total_path, new_name)
+        } else if let VaultEntry::Directory(dir) =
+            &mut self.children[self.map.get(name).unwrap().clone()]
+        {
+            dir.rename_entry(path, total_path, new_name, context, key)
         } else {
-            Err(VaultError::EntryNotFound(total_path.clone()))
+            Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            )))
         }
     }
 
@@ -875,29 +1052,38 @@ impl DirectoryEntry {
         mut path: VecDeque<&str>,
         total_path: &VaultPath,
         context: &mut VaultChangeContext,
-    ) -> Result<(), VaultError> {
+        key: &[u8],
+    ) -> Result<(), VaultChangeError> {
         let name = match path.pop_front() {
-            None => Err(VaultError::EntryNotFound(total_path.clone())),
+            None => Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone()))),
             Some(n) => Ok(n),
         }?;
 
-        if !self.children.contains_key(name) {
-            return Err(VaultError::EntryNotFound(total_path.clone()));
+        if !self.map.contains_key(name) {
+            return Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone())));
         }
 
         if path.is_empty() {
-            if let Some(entry) = self.children.remove(name) {
-                for block in entry.occupied_blocks().into_iter() {
-                    context
-                        .changes
-                        .push(DataBlockChange::new(block.start, block.len(), None));
-                }
+            let index = self.map.get(name).unwrap().clone();
+
+            if index == 0 {
+                self.first_child = self.children[0].entry_block() as i64;
+            } else {
+                let next: i64 = match self.children.get(index + 1) {
+                    None => -1,
+                    Some(entry) => entry.entry_block() as i64,
+                };
+                self.children[index - 1].change_next(next, context, key);
             }
+            let entry = self.children.remove(index);
+            // TODO finish cleanu
+            self.map.remove(name);
+
             Ok(())
-        } else if let VaultEntry::Directory(dir) = self.children.get_mut(name).as_mut().unwrap() {
-            dir.delete_entry(path, total_path, context)
+        } else if let VaultEntry::Directory(dir) = &mut self.children[self.map.get(name).unwrap().clone()] {
+            dir.delete_entry(path, total_path, context, key)
         } else {
-            Err(VaultError::EntryNotFound(total_path.clone()))
+            Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone())))
         }
     }
 
@@ -988,19 +1174,16 @@ impl VaultEntry {
         }
     }
 
-    pub fn rename(&mut self, new_name: String) -> Result<(), NameLengthExceededError> {
+    pub fn rename(
+        &mut self,
+        new_name: String,
+        key: &[u8],
+        context: &mut VaultChangeContext,
+    ) -> Result<(), RenameError> {
         match self {
-            Self::Directory(dir) => dir.rename(new_name),
-            Self::Secret(sec) => sec.rename(new_name),
-            Self::Password(pwd) => pwd.rename(new_name),
-        }
-    }
-
-    pub fn name(&self) -> &String {
-        match self {
-            VaultEntry::Directory(dir) => &dir.directory_name,
-            VaultEntry::Secret(sec) => &sec.secret_name,
-            VaultEntry::Password(pwd) => &pwd.password_name,
+            Self::Directory(dir) => dir.rename(new_name, key, context),
+            Self::Secret(sec) => sec.rename(new_name, key, context),
+            Self::Password(pwd) => pwd.rename(new_name, key, context),
         }
     }
 
@@ -1009,6 +1192,27 @@ impl VaultEntry {
             Self::Secret(sec) => sec.occupied_datablocks(),
             Self::Password(pwd) => pwd.occupied_datablocks(),
             Self::Directory(dir) => dir.occupied_datablocks(),
+        }
+    }
+
+    pub fn entry_block(&self) -> u64 {
+        match self {
+            Self::Secret(sec) => sec.entry_datablock(),
+            Self::Password(pwd) => pwd.entry_datablock(),
+            Self::Directory(dir) => dir.entry_datablock(),
+        }
+    }
+
+    pub fn change_next(
+        &mut self,
+        next_blk: i64,
+        context: &mut VaultChangeContext,
+        key: &[u8],
+    ) -> Result<(), SerializationError> {
+        match self {
+            Self::Secret(sec) => sec.change_next(next_blk, context, key),
+            Self::Password(pwd) => pwd.change_next(next_blk, context, key),
+            Self::Directory(dir) => dir.change_next(next_blk, context, key),
         }
     }
 }
