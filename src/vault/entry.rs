@@ -1055,12 +1055,16 @@ impl DirectoryEntry {
         key: &[u8],
     ) -> Result<(), VaultChangeError> {
         let name = match path.pop_front() {
-            None => Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone()))),
+            None => Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            ))),
             Some(n) => Ok(n),
         }?;
 
         if !self.map.contains_key(name) {
-            return Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone())));
+            return Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            )));
         }
 
         if path.is_empty() {
@@ -1080,10 +1084,14 @@ impl DirectoryEntry {
             self.map.remove(name);
 
             Ok(())
-        } else if let VaultEntry::Directory(dir) = &mut self.children[self.map.get(name).unwrap().clone()] {
+        } else if let VaultEntry::Directory(dir) =
+            &mut self.children[self.map.get(name).unwrap().clone()]
+        {
             dir.delete_entry(path, total_path, context, key)
         } else {
-            Err(VaultChangeError::VaultError(VaultError::EntryNotFound(total_path.clone())))
+            Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
+                total_path.clone(),
+            )))
         }
     }
 
@@ -1125,6 +1133,11 @@ impl DirectoryEntry {
             None => Ok(()),
             Some(_) => Err(VaultError::DuplicateEntry(name)),
         }
+    }
+
+    pub fn unoccupied_blocks(&self) {
+        let blocks = self.occupied_datablocks();
+        
     }
 }
 

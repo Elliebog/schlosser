@@ -1,15 +1,70 @@
 use std::{
-    fs::File,
-    io::{BufReader, Read, Seek, SeekFrom},
+    fs::{File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
+
+use bytes::Bytes;
 
 use crate::{
     crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn},
     vault::{
-        error::{InvalidVaultPathError, ReadDataBlockError, ReadFieldError},
-        manager::{DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH},
+        entry::{DirectoryEntry, Entry},
+        error::{
+            FileChangeError, InvalidBlock, InvalidVaultPathError, ReadDataBlockError,
+            ReadFieldError,
+        },
+        manager::{
+            DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH, VaultManager,
+        },
     },
 };
+
+/// A struct which handles vault changes. Interacts directly with the vault file
+#[derive(Debug)]
+pub struct VaultChangeContext {
+    vault_file: String,
+    empty_blocks: BlockSet,
+}
+
+impl VaultChangeContext {
+    fn new(vault_file: String, root: &DirectoryEntry) -> Self {
+        VaultChangeContext {
+            vault_file,
+            empty_blocks: root.occupied_datablocks().get_empty_space(),
+        }
+    }
+
+    /// Changes the next value of a directory entry. The specified block is assumed to be an entry
+    /// block and is not checked for this!!!
+    fn change_next(&self, block: u64) -> Result<(), FileChangeError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(false)
+            .open(Path::new(&self.vault_file))
+            .map_err(|e| FileChangeError::FileError(e))?;
+        let block_offset = VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| FileChangeError::FileError(e))? as u64;
+        if file_len < block_offset {
+            Err(FileChangeError::BlockNotFound(block))
+        } else {
+            file.seek(SeekFrom::Start(
+                VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64 + NEXT_OFFSET as u64,
+            ))
+            .map_err(|e| FileChangeError::FileError(e));
+
+            file.write(&block.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    fn change_data(&self, block: u64) {}
+    fn new_block(&mut self, data: Bytes) {}
+    fn delete_block(&mut self) 
+}
 
 /// A very primitive structure used to represent Paths inside of the vault. It only supports global
 /// paths and performs minimal checks on robustness
@@ -44,7 +99,7 @@ impl VaultPath {
     /// Gets the entry name of this path. (If one exists)
     pub fn name(&self) -> Option<&str> {
         let last = self.path.rfind('/').unwrap();
-        self.path.get(last+1..)
+        self.path.get(last + 1..)
     }
 
     pub fn into_string(self) -> String {
@@ -91,6 +146,25 @@ pub struct BlockSet {
 impl BlockSet {
     pub fn new() -> Self {
         BlockSet { blocks: Vec::new() }
+    }
+
+    /// Creates a new Blockset by gathering all empty blocks between the blocks of self
+    pub fn get_empty_space(&self) -> BlockSet {
+        let mut curr_block: u64 = 0;
+        let mut empty_blocks = BlockSet::new();
+        for block in self.blocks.iter() {
+            if curr_block == block.start {
+                curr_block += block.len() as u64;
+            } else {
+                let diff = match block.start.checked_sub(curr_block) {
+                    None => panic!("BlockSet encountered an internal error"),
+                    Some(v) => v,
+                };
+                empty_blocks.put(BlockRange::new(curr_block, diff as usize));
+                curr_block += diff;
+            }
+        }
+        empty_blocks
     }
 
     /// Put a new BlockRange into the Blockset and merge blocks if they overlap

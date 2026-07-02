@@ -13,7 +13,7 @@ use crate::vault::error::{
     Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
     SaveVaultError, VaultChangeEntryError,
 };
-use crate::vault::utils::{BlockSet, VaultPath, read_dyn_field, read_field};
+use crate::vault::utils::{BlockSet, VaultChangeContext, VaultPath, read_dyn_field, read_field};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::{
@@ -34,8 +34,10 @@ pub const VAULTNAME_LENGTH: usize = 128;
 const VAULTKEY_LENGTH: usize = 32;
 const VAULTKEY_ENC_LENGTH: usize = VAULTKEY_LENGTH + AES_GCM_AUTH_TAG;
 const VAULTTABLE_SIZE_LENGTH: usize = 8; //64 bit for u64
+pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH + VAULT_VERSION_LENGTH + VAULTNAME_LENGTH + IV_LENGTH + AES_NONCE_LENGTH + VAULTKEY_LENGTH;
 
 // Vault Table Constants
+pub const ENTRYTYPE_LENGTH: usize = 1;
 pub(crate) const PASSWORDENTRY_TYPE: u8 = 0;
 pub(crate) const SECRETENTRY_TYPE: u8 = 1;
 pub(crate) const DIRENTRY_TYPE: u8 = 2;
@@ -53,12 +55,13 @@ const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + AES_NONCE_LENGTH
     + VAULTKEY_ENC_LENGTH
     + AES_NONCE_LENGTH;
-pub(crate) const DATABLOCK_RAW_LENGTH: usize = 256;
-pub(crate) const DATABLOCK_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
+pub const DATABLOCK_RAW_LENGTH: usize = 256;
+pub const DATABLOCK_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
+pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH + AES_NONCE_LENGTH; 
 
 /// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
-struct VaultManager {
+pub struct VaultManager {
     /// Info regarding the header section
     header: HeaderInfo,
     /// The root vault entry
@@ -305,21 +308,6 @@ pub enum DataBlockChange {
 impl DataBlockChange {
     pub fn new(start: u64, len: usize, data: Option<Bytes>) -> Self {
         DataBlockChange { start, len, data }
-    }
-}
-
-#[derive(Debug)]
-pub struct VaultChangeContext {
-    pub changes: Vec<DataBlockChange>,
-    pub empty_blocks: BlockSet,
-}
-
-impl VaultChangeContext {
-    pub fn new(root_entry: &DirectoryEntry) -> Self {
-        VaultChangeContext {
-            changes: Vec::new(),
-            empty_blocks: root_entry.occupied_datablocks(),
-        }
     }
 }
 
