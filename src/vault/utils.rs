@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::{
     crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn},
@@ -28,16 +28,113 @@ pub struct VaultChangeContext {
 }
 
 impl VaultChangeContext {
-    fn new(vault_file: String, root: &DirectoryEntry) -> Self {
+    pub fn new(vault_file: String, root: &DirectoryEntry) -> Self {
         VaultChangeContext {
             vault_file,
             empty_blocks: root.occupied_datablocks().get_empty_space(),
         }
     }
 
-    /// Changes the next value of a directory entry. The specified block is assumed to be an entry
-    /// block and is not checked for this!!!
-    fn change_next(&self, block: u64) -> Result<(), FileChangeError> {
+    /// Changes the next value of an entry block.
+    /// Returns an error if the block cannot be found or the was a general file error
+    /// Assumes that the block is an entry block
+    pub fn change_next(&self, block: u64) -> Result<(), FileChangeError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(false)
+            .open(&self.vault_file)
+            .map_err(|e| FileChangeError::FileError(e))?;
+        let block_offset = VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| FileChangeError::FileError(e))? as u64;
+        if file_len < block_offset {
+            Err(FileChangeError::BlockNotFound(block))
+        } else {
+            file.seek(SeekFrom::Start(block_offset + NEXT_OFFSET as u64))
+                .map_err(|e| FileChangeError::FileError(e));
+
+            file.write(&block.to_be_bytes());
+            Ok(())
+        }
+    }
+
+    /// Changes a datablock (or multiple datablocks depending on length of data)
+    /// Panics if data length is not a multiple of DATABLOCK_LENGTH
+    /// This method assumes you are only changing the data and keeping the blockrange the same.
+    /// If shrinking/growing is needed use [`change_dyn_data`]
+    pub fn change_data(&self, block: u64, data: Bytes) -> Result<(), FileChangeError> {
+        let mut file = self.open_vault_at_block(block)?;
+        if data.len() % DATABLOCK_LENGTH != 0 {
+            panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
+        }
+        file.write(&data);
+        Ok(())
+    }
+
+    /// Create a new block with size determined by the amount of bytes in data (has to be a multiple
+    /// of DATABLOCK_LENGTH)
+    pub fn new_block(&mut self, data: Bytes) -> Result<BlockRange, FileChangeError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(false)
+            .open(&self.vault_file)
+            .map_err(|e| FileChangeError::FileError(e))?;
+        if data.len() % DATABLOCK_LENGTH != 0 {
+            panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
+        } 
+
+        let block_len = data.len() / DATABLOCK_LENGTH;
+        let new_block = self.empty_blocks.occupy(block_len);
+        
+        let offset = VAULTHEADER_LENGTH as u64 + new_block.start * DATABLOCK_LENGTH as u64;
+        let file_end = file.seek(SeekFrom::End(0)).map_err(|e| FileChangeError::FileError(e))?;
+        
+        if offset >= file_end {
+            file.write(&data);
+        } else {
+            file.seek(SeekFrom::Start(offset)).map_err(|e| FileChangeError::FileError(e))?;
+            file.write(&data).map_err(|e| FileChangeError::FileError(e))?;
+        }
+        Ok(new_block)
+    }
+
+    pub fn delete_block(&mut self, block: BlockRange) -> Result<(), FileChangeError> {
+        let mut file = self.open_vault_at_block(block.start)?;
+        let new_data = BytesMut::zeroed(block.len() * DATABLOCK_LENGTH);
+        file.write(&new_data.freeze());
+        self.empty_blocks.put(block);
+        Ok(())
+    }
+
+    /// Changes the data of a dynamic block (Multiblock structure) 
+    /// Returns a BlockRange if it the datablock grew/shrinked due to size constraints
+    /// Returns None if the datablock is not moved
+    pub fn change_dyn_block(&mut self, old_block: BlockRange, data: Bytes) -> Result<Option<BlockRange>, FileChangeError> {
+        if data.len() % DATABLOCK_LENGTH != 0 {
+            panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
+        }
+
+        let block_len = data.len() / DATABLOCK_LENGTH;
+        if block_len == old_block.len() {
+            self.change_data(old_block.start, data);
+            Ok(None)
+        } else if block_len > old_block.len() {
+            //mark old as empty
+            self.delete_block(old_block)?;
+            self.new_block(data).map(|e| Some(e))
+        } else {
+            let diff = old_block.len() - block_len;
+            self.delete_block(BlockRange::new(old_block.start+block_len as u64, diff));
+            self.change_data(old_block.start, data);
+            Ok(Some(BlockRange::new(old_block.start, block_len)))
+
+        }
+
+    }
+
+    fn open_vault_at_block(&self, block: u64) -> Result<File, FileChangeError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -48,22 +145,13 @@ impl VaultChangeContext {
         let file_len = file
             .seek(SeekFrom::End(0))
             .map_err(|e| FileChangeError::FileError(e))? as u64;
+
         if file_len < block_offset {
             Err(FileChangeError::BlockNotFound(block))
         } else {
-            file.seek(SeekFrom::Start(
-                VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64 + NEXT_OFFSET as u64,
-            ))
-            .map_err(|e| FileChangeError::FileError(e));
-
-            file.write(&block.to_be_bytes());
-            Ok(())
+            Ok(file)
         }
     }
-
-    fn change_data(&self, block: u64) {}
-    fn new_block(&mut self, data: Bytes) {}
-    fn delete_block(&mut self) 
 }
 
 /// A very primitive structure used to represent Paths inside of the vault. It only supports global

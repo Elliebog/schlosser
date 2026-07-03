@@ -170,5 +170,5 @@ pub enum SaveVaultError {
 
 pub enum FileChangeError {
     BlockNotFound(u64),
-    FileError(std::io::Error)
+    FileError(std::io::Error),
 }
