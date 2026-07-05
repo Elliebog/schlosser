@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -11,11 +11,11 @@ use crate::{
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
-            FileChangeError, InvalidBlock, InvalidVaultPathError, ReadDataBlockError,
+            FileChangeError, InvalidVaultPathError, ReadDataBlockError,
             ReadFieldError,
         },
         manager::{
-            DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH, VaultManager,
+            DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH,
         },
     },
 };
@@ -28,6 +28,9 @@ pub struct VaultChangeContext {
 }
 
 impl VaultChangeContext {
+    /// Create a new vaultcontext 
+    /// root is the root directory entry
+    /// vault_file is the path to the vault file
     pub fn new(vault_file: String, root: &DirectoryEntry) -> Self {
         VaultChangeContext {
             vault_file,
@@ -100,6 +103,8 @@ impl VaultChangeContext {
         Ok(new_block)
     }
 
+    /// Deletes a block, by zeroize-ing its contents and adding it to the internal empty block
+    /// Blockset
     pub fn delete_block(&mut self, block: BlockRange) -> Result<(), FileChangeError> {
         let mut file = self.open_vault_at_block(block.start)?;
         let new_data = BytesMut::zeroed(block.len() * DATABLOCK_LENGTH);

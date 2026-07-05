@@ -126,12 +126,13 @@ pub enum ReadFieldError {
 }
 
 pub enum VaultChangeError {
-    InputTooLarge,
     FileError(std::io::Error),
+    InputTooLarge,
     CryptographyError(CryptographyError),
     ExceededNameLength(NameLengthExceededError),
     SerializeError(SerializationError),
-    VaultError(VaultError)
+    VaultError(VaultError),
+    FileChangeError(FileChangeError)
 }
 
 impl From<CryptographyError> for VaultChangeError {
