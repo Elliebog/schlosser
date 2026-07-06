@@ -13,7 +13,7 @@ use crate::vault::error::{
     Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
     SaveVaultError, VaultChangeEntryError,
 };
-use crate::vault::utils::{BlockSet, VaultChangeContext, VaultPath, read_dyn_field, read_field};
+use crate::vault::utils::{BlockSet, VaultContext, VaultPath, read_dyn_field, read_field};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::{
@@ -57,7 +57,7 @@ const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + AES_NONCE_LENGTH;
 pub const DATABLOCK_RAW_LENGTH: usize = 256;
 pub const DATABLOCK_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
-pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH + AES_NONCE_LENGTH; 
+pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH; 
 
 /// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
@@ -69,7 +69,7 @@ pub struct VaultManager {
     /// The path to the archive file
     vault_path: String,
     /// internal context for tracking changes to the vault
-    context: VaultChangeContext,
+    context: VaultContext,
 }
 
 impl VaultManager {
@@ -79,7 +79,7 @@ impl VaultManager {
         let mut reader = BufReader::new(file);
         let header_info: HeaderInfo = HeaderInfo::build_header(&mut reader)?;
         let root_entry: DirectoryEntry = read_vault_table(&mut reader, &header_info)?;
-        let context = VaultChangeContext::new(&root_entry);
+        let context = VaultContext::new(&root_entry);
         Ok(VaultManager {
             header: header_info,
             root_entry,

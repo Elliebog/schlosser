@@ -1,4 +1,4 @@
-use std::string::FromUtf8Error;
+use std::{fs::TryLockError, string::FromUtf8Error};
 
 use crate::{crypt::CryptographyError, vault::utils::VaultPath};
 
@@ -172,4 +172,9 @@ pub enum SaveVaultError {
 pub enum FileChangeError {
     BlockNotFound(u64),
     FileError(std::io::Error),
+}
+
+pub enum VaultLockError{
+    FileError(std::io::Error),
+    VaultBusy,
 }

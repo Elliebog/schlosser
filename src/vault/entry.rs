@@ -21,7 +21,7 @@ use crate::{
             SECRETENTRY_TYPE, VAULTENTRY_LENGTH, VAULTENTRYNAME_LENGTH, VAULTNAME_LENGTH,
         },
         utils::{
-            BlockRange, BlockSet, VaultChangeContext, VaultPath, read_data_block,
+            BlockRange, BlockSet, VaultContext, VaultPath, read_data_block,
             read_dyn_data_block,
         },
     },
@@ -59,14 +59,14 @@ pub trait EncryptedEntry<I, O> {
     fn new(
         name: String,
         input: I,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError>
     where
         Self: Sized;
     fn change_secret(
         &mut self,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
         new_input: I,
     ) -> Result<(), VaultChangeError>;
@@ -90,7 +90,7 @@ pub trait Entry {
         &mut self,
         new_name: String,
         key: &[u8],
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
     ) -> Result<(), RenameError>;
     fn occupied_datablocks(&self) -> BlockSet;
     fn entry_datablock(&self) -> u64;
@@ -139,7 +139,7 @@ impl EncryptedEntry<String, String> for PasswordEntry {
     fn new(
         name: String,
         input: String,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError> {
         if name.len() > VAULTENTRYNAME_LENGTH {
@@ -187,7 +187,7 @@ impl EncryptedEntry<String, String> for PasswordEntry {
 
     fn change_secret(
         &mut self,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
         new_input: String,
     ) -> Result<(), VaultChangeError> {
@@ -236,7 +236,7 @@ impl Entry for PasswordEntry {
         &mut self,
         new_name: String,
         key: &[u8],
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
     ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
             Err(RenameError::NameError(NameLengthExceededError {
@@ -376,7 +376,7 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
     fn new(
         name: String,
         input: String,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<Self, VaultChangeError> {
         if name.len() > VAULTNAME_LENGTH {
@@ -417,7 +417,7 @@ impl EncryptedEntry<String, Bytes> for SecretFileEntry {
 
     fn change_secret(
         &mut self,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
         new_input: String,
     ) -> Result<(), VaultChangeError> {
@@ -535,7 +535,7 @@ impl Entry for SecretFileEntry {
         &mut self,
         new_name: String,
         key: &[u8],
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
     ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
             Err(RenameError::NameError(NameLengthExceededError {
@@ -669,7 +669,7 @@ impl Entry for DirectoryEntry {
         &mut self,
         new_name: String,
         key: &[u8],
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
     ) -> Result<(), RenameError> {
         if new_name.len() > VAULTNAME_LENGTH {
             Err(RenameError::NameError(NameLengthExceededError {
@@ -709,7 +709,7 @@ impl DirectoryEntry {
     pub fn new(
         dir_name: String,
         key: &[u8],
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
     ) -> Result<Self, VaultChangeError> {
         if dir_name.len() > VAULTNAME_LENGTH {
             Err(VaultChangeError::ExceededNameLength(
@@ -870,7 +870,7 @@ impl DirectoryEntry {
         mut path: VecDeque<&str>,
         total_path: &VaultPath,
         new_name: String,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<(), VaultChangeError> {
         // pop next name
@@ -925,7 +925,7 @@ impl DirectoryEntry {
         &mut self,
         mut path: VecDeque<&str>,
         total_path: &VaultPath,
-        context: &mut VaultChangeContext,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<(), VaultChangeError> {
         let name = match path.pop_front() {
@@ -1121,7 +1121,7 @@ impl Ord for VaultEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (VaultEntry::Password(pwd1), VaultEntry::Password(pwd2)) => {
-                pwd1.password_name.cmp(&pwd2.password_name)
+                pwd1.name.cmp(&pwd2.password_name)
             }
             (VaultEntry::Password(pwd), VaultEntry::Secret(sec)) => {
                 pwd.password_name.cmp(&sec.secret_name)
