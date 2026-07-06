@@ -51,12 +51,12 @@ impl VaultContext {
     /// Changes the next value of an entry block.
     /// Returns an error if the block cannot be found or the was a general file error
     /// Assumes that the block is an entry block
-    pub fn change_next(&mut self, block: u64) -> Result<(), FileChangeError> {
+    pub fn change_next(&mut self, block: u64, new_value: i64) -> Result<(), FileChangeError> {
         self.jump_to_block(block)?;
         self.vault_file
             .seek(SeekFrom::Current(NEXT_OFFSET as i64))
             .map_err(|e| FileChangeError::FileError(e));
-        self.vault_file.write(&block.to_be_bytes());
+        self.vault_file.write(&new_value.to_be_bytes());
         Ok(())
     }
 
