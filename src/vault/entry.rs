@@ -1023,6 +1023,10 @@ impl DirectoryEntry {
             }
         }
     }
+
+    pub fn build_entry_rec(curr_block: u64, &mut VaultContext, key: &[u8]) -> Result<Self, ReadVaultFileError> {
+         
+    }
 }
 
 /// A vault entry found in the vault entry table

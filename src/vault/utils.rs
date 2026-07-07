@@ -1,22 +1,27 @@
 use std::{
     fs::{File, OpenOptions, TryLockError},
     io::{BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
 };
 
 use bytes::{Bytes, BytesMut};
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn},
+    crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn, encrypt_region},
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
             FileChangeError, InvalidVaultPathError, ReadDataBlockError, ReadFieldError,
-            VaultLockError,
+            SeekFileError, VaultFileError, VaultLockError,
         },
-        manager::{DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH},
+        manager::{
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH,
+            ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH,
+        },
     },
 };
+
+const ENTRY_ENC_LENGTH: usize =
+    DATABLOCK_LENGTH - ENTRYTYPE_LENGTH - BLOCKID_LENGTH - AES_NONCE_LENGTH;
 
 /// A struct which handles vault changes. Interacts directly with the vault file
 #[derive(Debug)]
@@ -30,7 +35,7 @@ impl VaultContext {
     /// root is the root directory entry
     /// vault_file is the path to the vault file
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
-    pub fn new(vault_file: String, root: &DirectoryEntry) -> Result<Self, VaultLockError> {
+    pub fn new(vault_file: String) -> Result<Self, VaultLockError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let file = OpenOptions::new()
             .read(true)
@@ -38,6 +43,11 @@ impl VaultContext {
             .append(false)
             .open(&vault_file)
             .map_err(|e| VaultLockError::FileError(e))?;
+        let mut context = VaultContext {
+            vault_file: file,
+            empty_blocks: BlockSet::new(),
+        };
+
         match file.try_lock() {
             Ok(()) => Ok(VaultContext {
                 vault_file: file,
@@ -52,7 +62,8 @@ impl VaultContext {
     /// Returns an error if the block cannot be found or the was a general file error
     /// Assumes that the block is an entry block
     pub fn change_next(&mut self, block: u64, new_value: i64) -> Result<(), FileChangeError> {
-        self.jump_to_block(block)?;
+        self.jump_to_block(block)
+            .map_err(|e| FileChangeError::SeekFileError(e))?;
         self.vault_file
             .seek(SeekFrom::Current(NEXT_OFFSET as i64))
             .map_err(|e| FileChangeError::FileError(e));
@@ -65,7 +76,8 @@ impl VaultContext {
     /// This method assumes you are only changing the data and keeping the blockrange the same.
     /// If shrinking/growing is needed use [`change_dyn_data`]
     pub fn change_data(&mut self, block: u64, data: Bytes) -> Result<(), FileChangeError> {
-        self.jump_to_block(block)?;
+        self.jump_to_block(block)
+            .map_err(|e| FileChangeError::SeekFileError(e))?;
         if data.len() % DATABLOCK_LENGTH != 0 {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
@@ -84,16 +96,19 @@ impl VaultContext {
         let new_block = self.empty_blocks.occupy(block_len);
 
         let offset = VAULTHEADER_LENGTH as u64 + new_block.start * DATABLOCK_LENGTH as u64;
-        let file_end = self.vault_file
+        let file_end = self
+            .vault_file
             .seek(SeekFrom::End(0))
             .map_err(|e| FileChangeError::FileError(e))?;
 
         if offset >= file_end {
             self.vault_file.write(&data);
         } else {
-            self.vault_file.seek(SeekFrom::Start(offset))
+            self.vault_file
+                .seek(SeekFrom::Start(offset))
                 .map_err(|e| FileChangeError::FileError(e))?;
-            self.vault_file.write(&data)
+            self.vault_file
+                .write(&data)
                 .map_err(|e| FileChangeError::FileError(e))?;
         }
         Ok(new_block)
@@ -102,7 +117,8 @@ impl VaultContext {
     /// Deletes a block, by zeroize-ing its contents and adding it to the internal empty block
     /// Blockset
     pub fn delete_block(&mut self, block: BlockRange) -> Result<(), FileChangeError> {
-        self.jump_to_block(block.start)?;
+        self.jump_to_block(block.start)
+            .map_err(|e| FileChangeError::SeekFileError(e))?;
         let new_data = BytesMut::zeroed(block.len() * DATABLOCK_LENGTH);
         self.vault_file.write(&new_data.freeze());
         self.empty_blocks.put(block);
@@ -137,19 +153,101 @@ impl VaultContext {
         }
     }
 
-    fn jump_to_block(&mut self, block: u64) -> Result<(), FileChangeError> {
+    /// Read a raw datablock from the vault file
+    /// returns an error on io failures or unexpected EOF or Invalid datablock ids
+    pub fn read_datablock(&mut self, block: u64) -> Result<[u8; DATABLOCK_LENGTH], VaultFileError> {
+        self.jump_to_block(block)
+            .map_err(|e| VaultFileError::SeekFileError(e))?;
+        let mut buf = [0u8; DATABLOCK_LENGTH];
+        let bytes_read = self
+            .vault_file
+            .read(&mut buf)
+            .map_err(|e| VaultFileError::FileError(e))?;
+        if bytes_read < DATABLOCK_LENGTH {
+            Err(VaultFileError::UnexpectedEOF)
+        } else {
+            Ok(buf)
+        }
+    }
+
+    /// Read a multi-datablock structure from the vault file
+    /// returns an error on io failures, unexpected EOF or invalid datablock ids
+    pub fn read_dyn_datablock(&mut self, block: BlockRange) -> Result<Bytes, VaultFileError> {
+        self.jump_to_block(block.start)
+            .map_err(|e| VaultFileError::SeekFileError(e))?;
+        let mut bytes = BytesMut::zeroed(DATABLOCK_LENGTH * block.len());
+        let bytes_read = self.vault_file.read(&mut bytes).map_err(|e| VaultFileError::FileError(e))?;
+        if bytes_read < DATABLOCK_LENGTH * block.len() {
+            Err(VaultFileError::UnexpectedEOF)
+        } else {
+            Ok(bytes.freeze())
+        }
+        
+    }
+
+    /// Reads a datablock containing an entry and decomposes it into its common structure
+    /// returns an error on io failures, unexpected EOF or invalid datablock ids
+    pub fn read_entry(&mut self, block: u64) -> Result<DatablockEntry, VaultFileError> {
+        self.jump_to_block(block)
+            .map_err(|e| VaultFileError::SeekFileError(e))?;
+        let mut buf = [0u8; DATABLOCK_LENGTH];
+        let bytes_read = self
+            .vault_file
+            .read(&mut buf)
+            .map_err(|e| VaultFileError::FileError(e))?;
+        if bytes_read < DATABLOCK_LENGTH {
+            Err(VaultFileError::UnexpectedEOF)
+        } else {
+            let mut offset = 0;
+
+            let mut entrytype_buf = [0u8; ENTRYTYPE_LENGTH];
+            entrytype_buf.copy_from_slice(&buf[offset..offset + ENTRYTYPE_LENGTH]);
+            let entrytype = u8::from_be_bytes(entrytype_buf);
+            offset += ENTRYTYPE_LENGTH;
+
+            let mut next_buf = [0u8; BLOCKID_LENGTH];
+            next_buf.copy_from_slice(&buf[offset..offset + BLOCKID_LENGTH]);
+            let next = i64::from_be_bytes(next_buf);
+            offset += BLOCKID_LENGTH;
+
+            let mut nonce = [0u8; AES_NONCE_LENGTH];
+            nonce.copy_from_slice(&buf[offset..offset + AES_NONCE_LENGTH]);
+            offset += AES_NONCE_LENGTH;
+
+            let mut data_buf = [0u8; ENTRY_ENC_LENGTH];
+            data_buf.copy_from_slice(&buf[offset..offset+ENTRY_ENC_LENGTH]);
+
+            Ok(DatablockEntry {
+                entry_type: entrytype,
+                next,
+                nonce,
+                data: data_buf,
+            })
+        }
+    }
+
+    fn jump_to_block(&mut self, block: u64) -> Result<(), SeekFileError> {
         let block_offset = VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64;
         let file_len = self
             .vault_file
             .seek(SeekFrom::End(0))
-            .map_err(|e| FileChangeError::FileError(e))? as u64;
+            .map_err(|e| SeekFileError::FileError(e))? as u64;
 
         if file_len < block_offset {
-            Err(FileChangeError::BlockNotFound(block))
+            Err(SeekFileError::BlockNotFound(block))
         } else {
             Ok(())
         }
     }
+}
+
+/// A structure summarizing the most essential fields of a Datablock entry (password, secretfile
+/// entry, directory entry)
+pub struct DatablockEntry {
+    entry_type: u8,
+    next: i64,
+    nonce: [u8; AES_NONCE_LENGTH],
+    data: [u8; ENTRY_ENC_LENGTH],
 }
 
 /// A very primitive structure used to represent Paths inside of the vault. It only supports global

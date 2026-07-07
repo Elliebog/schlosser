@@ -9,7 +9,7 @@ pub enum ReadVaultFileError {
     UTF8Error(FromUtf8Error, u64),
     ReadUserKeyError(std::io::Error),
     CryptographyError(CryptographyError),
-    RetrieveKeyError(RetrieveKeyError)
+    RetrieveKeyError(RetrieveKeyError),
 }
 
 pub enum InvalidFileReasons {
@@ -17,7 +17,7 @@ pub enum InvalidFileReasons {
     UnsupportedVersion,
     NoRootEntry,
     InvalidVaultStructure,
-    UnkownEntryType
+    UnkownEntryType,
 }
 
 pub enum RetrieveSecretError {
@@ -50,24 +50,24 @@ pub enum Operation {
 }
 
 pub enum EntryType {
-    Directory, 
+    Directory,
     Password,
-    Secret
+    Secret,
 }
 
 pub enum RenameEntryError {
     InvalidVaultPath(InvalidVaultPathError),
-    VaultError(VaultError)
+    VaultError(VaultError),
 }
 
 pub enum RenameError {
     SerializationError(SerializationError),
-    NameError(NameLengthExceededError)
+    NameError(NameLengthExceededError),
 }
 
 pub enum DeleteEntryError {
     InvalidVaultPath(InvalidVaultPathError),
-    VaultError(VaultError)
+    VaultError(VaultError),
 }
 
 pub enum NewEntryError {
@@ -75,17 +75,17 @@ pub enum NewEntryError {
     NameLengthError(NameLengthExceededError),
     InvalidVaultPath(InvalidVaultPathError),
     VaultChangeError(VaultChangeError),
-    RetrieveKeyError(RetrieveKeyError)
+    RetrieveKeyError(RetrieveKeyError),
 }
 
 #[derive(Debug)]
 pub struct InvalidVaultPathError {
-     pub path: String
+    pub path: String,
 }
 
 #[derive(Debug)]
 pub struct NameLengthExceededError {
-    pub len: usize
+    pub len: usize,
 }
 
 pub enum VaultChangeEntryError {
@@ -93,7 +93,7 @@ pub enum VaultChangeEntryError {
     InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError),
     InvalidOperation(Operation, EntryType),
-    RetrieveKeyError(RetrieveKeyError)
+    RetrieveKeyError(RetrieveKeyError),
 }
 
 impl From<VaultError> for VaultChangeEntryError {
@@ -132,7 +132,7 @@ pub enum VaultChangeError {
     ExceededNameLength(NameLengthExceededError),
     SerializeError(SerializationError),
     VaultError(VaultError),
-    FileChangeError(FileChangeError)
+    FileChangeError(FileChangeError),
 }
 
 impl From<CryptographyError> for VaultChangeError {
@@ -143,38 +143,49 @@ impl From<CryptographyError> for VaultChangeError {
 
 pub enum SerializationError {
     InvalidLength,
-    EncryptError(CryptographyError)
+    EncryptError(CryptographyError),
 }
 
-pub enum VaultError{
+pub enum VaultError {
     NameError(NameLengthExceededError),
     EntryNotFound(VaultPath),
-    DuplicateEntry(String), 
+    DuplicateEntry(String),
 }
-
 
 pub enum RetrieveKeyError {
     StdinError(std::io::Error),
-    DecryptError(CryptographyError)
+    DecryptError(CryptographyError),
 }
 
 pub enum EncryptVaultTableError {
     SerializationError(SerializationError),
     EncryptVaultError(CryptographyError),
-    RetrieveKeyError(RetrieveKeyError)
+    RetrieveKeyError(RetrieveKeyError),
 }
 
 pub enum SaveVaultError {
     EncryptVaultTableError(EncryptVaultTableError),
-    FileError(std::io::Error)
+    FileError(std::io::Error),
 }
 
 pub enum FileChangeError {
-    BlockNotFound(u64),
+    SeekFileError(SeekFileError),
     FileError(std::io::Error),
 }
 
-pub enum VaultLockError{
+pub enum VaultLockError {
     FileError(std::io::Error),
     VaultBusy,
+}
+
+pub enum VaultFileError {
+    CryptographyError(CryptographyError),
+    FileError(std::io::Error),
+    SeekFileError(SeekFileError),
+    UnexpectedEOF,
+}
+
+pub enum SeekFileError {
+    BlockNotFound(u64),
+    FileError(std::io::Error),
 }

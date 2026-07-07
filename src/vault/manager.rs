@@ -2,14 +2,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use zeroize::Zeroize;
 
 use crate::crypt::{
-    AES_NONCE_LENGTH, EncryptedData, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn,
-    encrypt_dyn_region, generate_user_key,
+    AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key,
 };
 use crate::vault::entry::{
     DirectoryEntry, EncryptedEntry, Entry, EntryResult, PasswordEntry, SecretFileEntry, VaultEntry,
 };
 use crate::vault::error::{
-    DeleteEntryError, EncryptVaultTableError, EntryType, InvalidFileReasons, NewEntryError,
+    DeleteEntryError, EntryType, InvalidFileReasons, NewEntryError,
     Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
     SaveVaultError, VaultChangeEntryError,
 };
@@ -34,7 +33,12 @@ pub const VAULTNAME_LENGTH: usize = 128;
 const VAULTKEY_LENGTH: usize = 32;
 const VAULTKEY_ENC_LENGTH: usize = VAULTKEY_LENGTH + AES_GCM_AUTH_TAG;
 const VAULTTABLE_SIZE_LENGTH: usize = 8; //64 bit for u64
-pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH + VAULT_VERSION_LENGTH + VAULTNAME_LENGTH + IV_LENGTH + AES_NONCE_LENGTH + VAULTKEY_LENGTH;
+pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
+    + VAULT_VERSION_LENGTH
+    + VAULTNAME_LENGTH
+    + IV_LENGTH
+    + AES_NONCE_LENGTH
+    + VAULTKEY_LENGTH;
 
 // Vault Table Constants
 pub const ENTRYTYPE_LENGTH: usize = 1;
@@ -44,20 +48,12 @@ pub(crate) const DIRENTRY_TYPE: u8 = 2;
 pub(crate) const VAULTENTRY_LENGTH: usize = 177;
 pub const VAULTENTRYNAME_LENGTH: usize = 128;
 const VAULTENTRYTYPE_LENGTH: usize = 1;
-pub const DIRENTRY_SIZE_LENGTH: usize = 8;
 pub const BLOCKID_LENGTH: usize = 8;
 pub const SECRET_SIZE_LENGTH: usize = 8;
 // Vault data constants
-const HEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
-    + VAULT_VERSION_LENGTH
-    + VAULTNAME_LENGTH
-    + IV_LENGTH
-    + AES_NONCE_LENGTH
-    + VAULTKEY_ENC_LENGTH
-    + AES_NONCE_LENGTH;
 pub const DATABLOCK_RAW_LENGTH: usize = 256;
 pub const DATABLOCK_LENGTH: usize = DATABLOCK_RAW_LENGTH + AES_GCM_AUTH_TAG;
-pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH; 
+pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH;
 
 /// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
@@ -79,7 +75,8 @@ impl VaultManager {
         let mut reader = BufReader::new(file);
         let header_info: HeaderInfo = HeaderInfo::build_header(&mut reader)?;
         let root_entry: DirectoryEntry = read_vault_table(&mut reader, &header_info)?;
-        let context = VaultContext::new(&root_entry);
+        //TODO handle vaultcontext locking error
+        let context = VaultContext::new(file_path, &root_entry);
         Ok(VaultManager {
             header: header_info,
             root_entry,
@@ -293,16 +290,9 @@ impl VaultManager {
 
 #[derive(Debug)]
 pub enum DataBlockChange {
-    ChangeBlock {
-        start: u64,
-        len: usize,
-        data: Bytes,
-    },
+    ChangeBlock { start: u64, len: usize, data: Bytes },
     ChangeNext(i64),
-    Zeroize {
-        start: u64, 
-        len: usize,
-    }
+    Zeroize { start: u64, len: usize },
 }
 
 impl DataBlockChange {
