@@ -9,7 +9,7 @@ use crate::vault::entry::{
 };
 use crate::vault::error::{
     DeleteEntryError, EntryType, InvalidFileReasons, NewEntryError,
-    Operation, ReadVaultFileError, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
+    Operation, RenameEntryError, RetrieveKeyError, RetrieveSecretError,
     SaveVaultError, VaultChangeEntryError,
 };
 use crate::vault::utils::{BlockSet, VaultContext, VaultPath, read_dyn_field, read_field};

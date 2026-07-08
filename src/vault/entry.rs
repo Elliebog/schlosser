@@ -12,7 +12,9 @@ use crate::{
     crypt::{AES_NONCE_LENGTH, EncryptFileError, decrypt_region, encrypt_file, encrypt_region},
     vault::{
         error::{
-            EntryType, FileChangeError, NameLengthExceededError, Operation, ReadVaultFileError, RenameError, RetrieveSecretError, SerializationError, VaultChangeError, VaultError
+            BuildEntryError, BuildVaultError, EntryType, FileChangeError, NameLengthExceededError,
+            Operation, ReadVaultFileError, RenameError, RetrieveSecretError, SerializationError,
+            VaultChangeError, VaultError, VaultFileError,
         },
         manager::{
             AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DIRENTRY_TYPE, PASSWORDENTRY_TYPE,
@@ -20,7 +22,8 @@ use crate::{
             VAULTNAME_LENGTH,
         },
         utils::{
-            BlockRange, BlockSet, VaultContext, VaultPath, read_data_block, read_dyn_data_block,
+            BlockRange, BlockSet, DataBlockEntry, VaultContext, VaultPath, read_data_block,
+            read_dyn_data_block,
         },
     },
 };
@@ -78,10 +81,10 @@ pub trait Entry {
     /// Serializes the entry into an array that fits inside a datablock
     fn serialize(&self, key: &[u8]) -> Result<[u8; DATABLOCK_LENGTH], SerializationError>;
     fn build_entry(
-        data: [u8; VAULTENTRY_LENGTH],
+        data: DataBlockEntry,
         key: &[u8],
         entry_block: u64,
-    ) -> Result<Self, ReadVaultFileError>
+    ) -> Result<Self, BuildEntryError>
     where
         Self: Sized;
     fn rename(
@@ -93,6 +96,7 @@ pub trait Entry {
     fn occupied_datablocks(&self) -> BlockSet;
     fn entry_datablock(&self) -> u64;
     fn get_name(&self) -> String;
+    fn get_next(&self) -> i64;
 }
 
 /// Entry that holds a password
@@ -265,41 +269,31 @@ impl Entry for PasswordEntry {
     }
 
     fn build_entry(
-        data: [u8; VAULTENTRY_LENGTH],
+        data: DataBlockEntry,
         key: &[u8],
         entry_block: u64,
-    ) -> Result<Self, ReadVaultFileError>
+    ) -> Result<Self, BuildEntryError>
     where
         Self: Sized,
     {
         //Password Entry
-        let mut offset: usize = 1;
-        let mut next_buf = [0u8; BLOCKID_LENGTH];
-        next_buf.copy_from_slice(&data[offset..offset + BLOCKID_LENGTH]);
-        let next_blk = i64::from_be_bytes(next_buf);
-        offset += BLOCKID_LENGTH;
-        // build_entry function starts after the type of entry has been determined
-        // can safely unwrap because we always take at least AES_NONCE_LENGTH items and it is
-        // guaranteed to have space due to fixed array length
-        let nonce: &[u8; AES_NONCE_LENGTH] =
-            &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
-        offset += AES_NONCE_LENGTH;
-        let entry_data: [u8; PWDENTRY_ENC_LENGTH - AES_GCM_AUTH_TAG] = decrypt_region(
-            &data[offset..offset + PWDENTRY_ENC_LENGTH]
+
+        let entry_data: [u8; PWDENTRY_ENC_LENGTH] = decrypt_region(
+            &data.data[..PWDENTRY_ENC_LENGTH + AES_GCM_AUTH_TAG]
                 .try_into()
                 .unwrap(),
-            nonce,
+            &data.nonce,
             key,
         )
-        .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
+        .map_err(|e| BuildEntryError::CryptographyError(e))?;
 
-        offset = 0;
+        let mut offset = 0;
         // Get the decrypted fields and build struct
         // use a BytesMut buffer because the converted string does not have the same length
         let mut namebuffer = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
         //check if name is valid utf8
         let name = String::from_utf8(entry_data[offset..offset + VAULTENTRYNAME_LENGTH].to_vec())
-            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+            .map_err(|e| BuildEntryError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
         namebuffer.put_slice(name.as_bytes());
 
@@ -313,7 +307,7 @@ impl Entry for PasswordEntry {
         Ok(PasswordEntry {
             name: *namebuffer.freeze().as_array().unwrap(),
             block: entry_block,
-            next: next_blk,
+            next: data.next,
             pwd_block: pwd_blk_id,
             pwd_block_nonce: pwd_nonce_buf,
         })
@@ -325,6 +319,10 @@ impl Entry for PasswordEntry {
 
     fn get_name(&self) -> String {
         String::from_utf8(self.name.to_vec()).unwrap()
+    }
+
+    fn get_next(&self) -> i64 {
+        self.next
     }
 }
 
@@ -480,34 +478,28 @@ impl Entry for SecretFileEntry {
     }
 
     fn build_entry(
-        data: [u8; VAULTENTRY_LENGTH],
+        data: DataBlockEntry,
         key: &[u8],
         entry_block: u64,
-    ) -> Result<Self, ReadVaultFileError>
+    ) -> Result<Self, BuildEntryError>
     where
         Self: Sized,
     {
         //Secret File Entry
-        let mut offset = 1;
+        let entry = decrypt_region::<SECENTRY_ENC_LENGTH>(
+            &data.data[..SECENTRY_ENC_LENGTH + AES_GCM_AUTH_TAG]
+                .try_into()
+                .unwrap(),
+            &data.nonce,
+            key,
+        )
+        .map_err(|e| BuildEntryError::CryptographyError(e))?;
 
-        let mut next_buf = [0u8; BLOCKID_LENGTH];
-        next_buf.copy_from_slice(&data[offset..offset + BLOCKID_LENGTH]);
-        let next_blk = i64::from_be_bytes(next_buf);
-        offset += BLOCKID_LENGTH;
-
-        let nonce = &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
-        offset += AES_NONCE_LENGTH;
-        let enc_data = &data[offset..offset + SECENTRY_ENC_LENGTH + AES_GCM_AUTH_TAG]
-            .try_into()
-            .unwrap();
-        let entry = decrypt_region::<SECENTRY_ENC_LENGTH>(enc_data, nonce, key)
-            .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
-
-        offset = 0;
+        let mut offset = 0;
         let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
         // make sure it is valid utf8
         let name = String::from_utf8(entry[offset..offset + VAULTENTRY_LENGTH].to_vec())
-            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+            .map_err(|e| BuildEntryError::UTF8Error(e, offset as u64))?;
         namebuf.put_slice(name.as_bytes());
         offset += VAULTENTRYNAME_LENGTH;
 
@@ -527,7 +519,7 @@ impl Entry for SecretFileEntry {
         Ok(SecretFileEntry {
             name: *namebuf.freeze().as_array().unwrap(),
             block: entry_block,
-            next: next_blk,
+            next: data.next,
             start: start_blk,
             size: blk_size,
             nonce: nonce_buf,
@@ -572,6 +564,10 @@ impl Entry for SecretFileEntry {
 
     fn get_name(&self) -> String {
         String::from_utf8(self.name.to_vec()).unwrap()
+    }
+
+    fn get_next(&self) -> i64 {
+        self.next
     }
 }
 
@@ -628,33 +624,24 @@ impl Entry for DirectoryEntry {
     }
 
     fn build_entry(
-        data: [u8; VAULTENTRY_LENGTH],
+        data: DataBlockEntry,
         key: &[u8],
         entry_block: u64,
-    ) -> Result<Self, ReadVaultFileError>
+    ) -> Result<Self, BuildEntryError>
     where
         Self: Sized,
     {
-        // Directory Entry
-        let mut offset: usize = 1;
+        let entry = decrypt_region::<PWDENTRY_ENC_LENGTH>(
+            &data.data[..DIRENTRY_ENC_LENGTH].try_into().unwrap(),
+            &data.nonce,
+            key,
+        )
+        .map_err(|e| BuildEntryError::CryptographyError(e))?;
 
-        let mut next_buf = [0u8; BLOCKID_LENGTH];
-        next_buf.copy_from_slice(&data[offset..offset + BLOCKID_LENGTH]);
-        let next_blk = i64::from_be_bytes(next_buf);
-        offset += BLOCKID_LENGTH;
-
-        let nonce = &data[offset..offset + AES_NONCE_LENGTH].try_into().unwrap();
-        offset += AES_NONCE_LENGTH;
-        let enc_data = &data[offset..offset + DIRENTRY_ENC_LENGTH]
-            .try_into()
-            .unwrap();
-        let entry = decrypt_region::<PWDENTRY_ENC_LENGTH>(enc_data, nonce, key)
-            .map_err(|e| ReadVaultFileError::CryptographyError(e))?;
-
+        let mut offset = 0;
         let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
-        offset = 0;
         let name = String::from_utf8(entry[offset..offset + VAULTENTRY_LENGTH].to_vec())
-            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset as u64))?;
+            .map_err(|e| BuildEntryError::UTF8Error(e, offset as u64))?;
         offset += VAULTENTRYNAME_LENGTH;
         namebuf.put_slice(name.as_bytes());
 
@@ -665,7 +652,7 @@ impl Entry for DirectoryEntry {
         Ok(DirectoryEntry {
             name: *namebuf.freeze().as_array().unwrap(),
             block: entry_block,
-            next: next_blk,
+            next: data.next,
             first_child: child,
             children: Vec::new(),
             map: HashMap::new(),
@@ -715,6 +702,10 @@ impl Entry for DirectoryEntry {
 
     fn get_name(&self) -> String {
         String::from_utf8(self.name.to_vec()).unwrap()
+    }
+
+    fn get_next(&self) -> i64 {
+        self.next
     }
 }
 
@@ -996,13 +987,10 @@ impl DirectoryEntry {
         key: &[u8],
     ) -> Result<(), VaultError> {
         if path.len() == 1 {
-            let last_index = self.children.len() -1;
+            let last_index = self.children.len() - 1;
             //This is the parent directory -> Add it as a direct child
-            self.children[last_index].change_next(
-                new_entry.entry_block() as i64,
-                context,
-            );
-            self.map.insert(new_entry.name(), last_index+1);
+            self.children[last_index].change_next(new_entry.entry_block() as i64, context);
+            self.map.insert(new_entry.name(), last_index + 1);
             self.children.push(new_entry);
             Ok(())
         } else {
@@ -1013,7 +1001,7 @@ impl DirectoryEntry {
 
             let entry = match self.map.get(name) {
                 None => Err(VaultError::EntryNotFound(parent_path.clone())),
-                Some(e) => Ok(&mut self.children[e.clone()])
+                Some(e) => Ok(&mut self.children[e.clone()]),
             }?;
 
             if let VaultEntry::Directory(dir) = entry {
@@ -1024,8 +1012,53 @@ impl DirectoryEntry {
         }
     }
 
-    pub fn build_entry_rec(curr_block: u64, &mut VaultContext, key: &[u8]) -> Result<Self, ReadVaultFileError> {
-         
+    pub fn build_entry_rec(
+        start_block: u64,
+        context: &mut VaultContext,
+        key: &[u8],
+    ) -> Result<Self, BuildVaultError> {
+        // create the directory entry from the current block
+        let datablock = context
+            .read_entry(start_block)
+            .map_err(|e| BuildVaultError::VaultFileError(e))?;
+        if datablock.entry_type != DIRENTRY_TYPE {
+            return Err(BuildVaultError::InvalidEntryType);
+        }
+
+        let mut dir_entry = DirectoryEntry::build_entry(datablock, key, start_block)
+            .map_err(|e| BuildVaultError::BuildEntryError(e))?;
+
+        let mut curr_block = dir_entry.first_child;
+        loop {
+            if curr_block < 0 {
+                break Ok(dir_entry)
+            } else {
+                let datablock = context
+                    .read_entry(curr_block as u64)
+                    .map_err(|e| BuildVaultError::VaultFileError(e))?;
+                let entry =
+                    match datablock.entry_type {
+                        PASSWORDENTRY_TYPE => Ok(VaultEntry::Password(PasswordEntry::build_entry(
+                            datablock,
+                            key,
+                            curr_block as u64,
+                        )
+                        .map_err(|e| BuildVaultError::BuildEntryError(e))?)),
+                        SECRETENTRY_TYPE => Ok(VaultEntry::Secret(SecretFileEntry::build_entry(
+                            datablock,
+                            key,
+                            curr_block as u64,
+                        )
+                        .map_err(|e| BuildVaultError::BuildEntryError(e))?)),
+                        DIRENTRY_TYPE => Ok(VaultEntry::Directory(
+                            DirectoryEntry::build_entry_rec(curr_block as u64, context, key)?,
+                        )),
+                        _ => Err(BuildVaultError::InvalidEntryType),
+                    }?;
+                curr_block = entry.next();
+                dir_entry.children.push(entry);
+            }
+        }
     }
 }
 
@@ -1052,6 +1085,14 @@ impl VaultEntry {
             VaultEntry::Password(pwd) => pwd.get_name(),
             VaultEntry::Secret(sec) => sec.get_name(),
             VaultEntry::Directory(dir) => dir.get_name(),
+        }
+    }
+
+    pub fn next(&self) -> i64 {
+        match self {
+            VaultEntry::Password(pwd) => pwd.get_next(),
+            VaultEntry::Secret(sec) => sec.get_next(),
+            VaultEntry::Directory(dir) => dir.get_next()
         }
     }
 
@@ -1133,6 +1174,7 @@ impl VaultEntry {
         }
     }
 }
+
 impl PartialOrd for VaultEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -1142,33 +1184,15 @@ impl PartialOrd for VaultEntry {
 impl Ord for VaultEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (VaultEntry::Password(pwd1), VaultEntry::Password(pwd2)) => {
-                pwd1.name.cmp(&pwd2.name)
-            }
-            (VaultEntry::Password(pwd), VaultEntry::Secret(sec)) => {
-                pwd.name.cmp(&sec.name)
-            }
-            (VaultEntry::Password(pwd), VaultEntry::Directory(dir)) => {
-                pwd.name.cmp(&dir.name)
-            }
-            (VaultEntry::Secret(sec), VaultEntry::Password(pwd)) => {
-                sec.name.cmp(&pwd.name)
-            }
-            (VaultEntry::Secret(sec1), VaultEntry::Secret(sec2)) => {
-                sec1.name.cmp(&sec2.name)
-            }
-            (VaultEntry::Secret(sec), VaultEntry::Directory(dir)) => {
-                sec.name.cmp(&dir.name)
-            }
-            (VaultEntry::Directory(dir), VaultEntry::Password(pwd)) => {
-                dir.name.cmp(&pwd.name)
-            }
-            (VaultEntry::Directory(dir), VaultEntry::Secret(sec)) => {
-                dir.name.cmp(&sec.name)
-            }
-            (VaultEntry::Directory(dir1), VaultEntry::Directory(dir2)) => {
-                dir1.name.cmp(&dir2.name)
-            }
+            (VaultEntry::Password(pwd1), VaultEntry::Password(pwd2)) => pwd1.name.cmp(&pwd2.name),
+            (VaultEntry::Password(pwd), VaultEntry::Secret(sec)) => pwd.name.cmp(&sec.name),
+            (VaultEntry::Password(pwd), VaultEntry::Directory(dir)) => pwd.name.cmp(&dir.name),
+            (VaultEntry::Secret(sec), VaultEntry::Password(pwd)) => sec.name.cmp(&pwd.name),
+            (VaultEntry::Secret(sec1), VaultEntry::Secret(sec2)) => sec1.name.cmp(&sec2.name),
+            (VaultEntry::Secret(sec), VaultEntry::Directory(dir)) => sec.name.cmp(&dir.name),
+            (VaultEntry::Directory(dir), VaultEntry::Password(pwd)) => dir.name.cmp(&pwd.name),
+            (VaultEntry::Directory(dir), VaultEntry::Secret(sec)) => dir.name.cmp(&sec.name),
+            (VaultEntry::Directory(dir1), VaultEntry::Directory(dir2)) => dir1.name.cmp(&dir2.name),
         }
     }
 }

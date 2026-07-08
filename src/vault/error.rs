@@ -1,16 +1,8 @@
 use std::{fs::TryLockError, string::FromUtf8Error};
 
 use crate::{crypt::CryptographyError, vault::utils::VaultPath};
+//TODO Re-evalute if we should not panic more often for a lot of these errors
 
-pub enum ReadVaultFileError {
-    FileError(std::io::Error),
-    ReadFieldError(ReadFieldError, u64),
-    InvalidFile(InvalidFileReasons),
-    UTF8Error(FromUtf8Error, u64),
-    ReadUserKeyError(std::io::Error),
-    CryptographyError(CryptographyError),
-    RetrieveKeyError(RetrieveKeyError),
-}
 
 pub enum InvalidFileReasons {
     WrongSignature,
@@ -185,7 +177,23 @@ pub enum VaultFileError {
     UnexpectedEOF,
 }
 
+pub enum BuildVaultError {
+    VaultFileError(VaultFileError),
+    BuildEntryError(BuildEntryError),
+    InvalidEntryType,
+}
+
 pub enum SeekFileError {
     BlockNotFound(u64),
     FileError(std::io::Error),
+}
+
+pub enum BuildEntryError {
+    UTF8Error(FromUtf8Error, u64),
+    CryptographyError(CryptographyError),
+}
+
+pub enum InitVaultContextError {
+    BuildVaultError(BuildVaultError),
+    VaultLockError(VaultLockError)
 }

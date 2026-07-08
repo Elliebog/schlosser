@@ -6,15 +6,15 @@ use std::{
 use bytes::{Bytes, BytesMut};
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn, encrypt_region},
+    crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn},
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
-            FileChangeError, InvalidVaultPathError, ReadDataBlockError, ReadFieldError,
-            SeekFileError, VaultFileError, VaultLockError,
+            FileChangeError, InitVaultContextError, InvalidVaultPathError, ReadDataBlockError,
+            ReadFieldError, SeekFileError, VaultFileError, VaultLockError,
         },
         manager::{
-            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH,
+            BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH,
             ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH,
         },
     },
@@ -31,30 +31,34 @@ pub struct VaultContext {
 }
 
 impl VaultContext {
-    /// Create a new vaultcontext
-    /// root is the root directory entry
-    /// vault_file is the path to the vault file
+    /// Create a new vaultcontext root is the root directory entry vault_file is the path to the vault file
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
-    pub fn new(vault_file: String) -> Result<Self, VaultLockError> {
+    pub fn new(vault_file: String, key: &[u8]) -> Result<Self, InitVaultContextError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(false)
             .open(&vault_file)
-            .map_err(|e| VaultLockError::FileError(e))?;
+            .map_err(|e| InitVaultContextError::VaultLockError(VaultLockError::FileError(e)))?;
         let mut context = VaultContext {
             vault_file: file,
             empty_blocks: BlockSet::new(),
         };
 
-        match file.try_lock() {
-            Ok(()) => Ok(VaultContext {
-                vault_file: file,
-                empty_blocks: root.occupied_datablocks().get_empty_space(),
-            }),
-            Err(TryLockError::WouldBlock) => Err(VaultLockError::VaultBusy),
-            Err(TryLockError::Error(e)) => Err(VaultLockError::FileError(e)),
+        match context.vault_file.try_lock() {
+            Ok(()) => {
+                let root = DirectoryEntry::build_entry_rec(0, &mut context, key)
+                    .map_err(|e| InitVaultContextError::BuildVaultError(e))?;
+                context.empty_blocks = root.occupied_datablocks().get_empty_space();
+                Ok(context)
+            }
+            Err(TryLockError::WouldBlock) => Err(InitVaultContextError::VaultLockError(
+                VaultLockError::VaultBusy,
+            )),
+            Err(TryLockError::Error(e)) => Err(InitVaultContextError::VaultLockError(
+                VaultLockError::FileError(e),
+            )),
         }
     }
 
@@ -176,18 +180,20 @@ impl VaultContext {
         self.jump_to_block(block.start)
             .map_err(|e| VaultFileError::SeekFileError(e))?;
         let mut bytes = BytesMut::zeroed(DATABLOCK_LENGTH * block.len());
-        let bytes_read = self.vault_file.read(&mut bytes).map_err(|e| VaultFileError::FileError(e))?;
+        let bytes_read = self
+            .vault_file
+            .read(&mut bytes)
+            .map_err(|e| VaultFileError::FileError(e))?;
         if bytes_read < DATABLOCK_LENGTH * block.len() {
             Err(VaultFileError::UnexpectedEOF)
         } else {
             Ok(bytes.freeze())
         }
-        
     }
 
     /// Reads a datablock containing an entry and decomposes it into its common structure
     /// returns an error on io failures, unexpected EOF or invalid datablock ids
-    pub fn read_entry(&mut self, block: u64) -> Result<DatablockEntry, VaultFileError> {
+    pub fn read_entry(&mut self, block: u64) -> Result<DataBlockEntry, VaultFileError> {
         self.jump_to_block(block)
             .map_err(|e| VaultFileError::SeekFileError(e))?;
         let mut buf = [0u8; DATABLOCK_LENGTH];
@@ -215,9 +221,9 @@ impl VaultContext {
             offset += AES_NONCE_LENGTH;
 
             let mut data_buf = [0u8; ENTRY_ENC_LENGTH];
-            data_buf.copy_from_slice(&buf[offset..offset+ENTRY_ENC_LENGTH]);
+            data_buf.copy_from_slice(&buf[offset..offset + ENTRY_ENC_LENGTH]);
 
-            Ok(DatablockEntry {
+            Ok(DataBlockEntry {
                 entry_type: entrytype,
                 next,
                 nonce,
@@ -226,6 +232,7 @@ impl VaultContext {
         }
     }
 
+    /// Internal function that seeks to a certain block offset
     fn jump_to_block(&mut self, block: u64) -> Result<(), SeekFileError> {
         let block_offset = VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64;
         let file_len = self
@@ -243,11 +250,11 @@ impl VaultContext {
 
 /// A structure summarizing the most essential fields of a Datablock entry (password, secretfile
 /// entry, directory entry)
-pub struct DatablockEntry {
-    entry_type: u8,
-    next: i64,
-    nonce: [u8; AES_NONCE_LENGTH],
-    data: [u8; ENTRY_ENC_LENGTH],
+pub struct DataBlockEntry {
+    pub entry_type: u8,
+    pub next: i64,
+    pub nonce: [u8; AES_NONCE_LENGTH],
+    pub data: [u8; ENTRY_ENC_LENGTH],
 }
 
 /// A very primitive structure used to represent Paths inside of the vault. It only supports global
