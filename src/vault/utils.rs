@@ -1,33 +1,151 @@
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io::{BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write, stdin},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, decrypt_region, decrypt_region_dyn},
+    crypt::{AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key},
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
-            FileChangeError, InitVaultContextError, InvalidVaultPathError, ReadDataBlockError,
-            ReadFieldError, SeekFileError, VaultFileError, VaultLockError,
+            FileChangeError, InitVaultContextError, InvalidFileReasons, InvalidVaultPathError, ReadDataBlockError, ReadFieldError, ReadHeaderError, RetrieveKeyError, SeekFileError, VaultFileError, VaultLockError
         },
         manager::{
-            BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH,
-            ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTHEADER_LENGTH,
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTNAME_LENGTH
         },
     },
 };
 
 const ENTRY_ENC_LENGTH: usize =
     DATABLOCK_LENGTH - ENTRYTYPE_LENGTH - BLOCKID_LENGTH - AES_NONCE_LENGTH;
+// Header Constants
+const VAULT_SIGNATURE: u64 = 0x0000e111e0afbaca;
+const VAULT_SIGNATURE_LENGTH: usize = 8;
+const VAULT_VERSION: u8 = 1;
+const VAULT_VERSION_LENGTH: usize = 1;
+
+const VAULTKEY_ENC_LENGTH: usize = KEY_LENGTH + AES_GCM_AUTH_TAG;
+pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
+    + VAULT_VERSION_LENGTH
+    + VAULTNAME_LENGTH
+    + IV_LENGTH
+    + AES_NONCE_LENGTH
+    + VAULTKEY_ENC_LENGTH;
+
+
+/// Header Information of the archive file
+#[derive(Debug)]
+struct HeaderInfo {
+    /// Version specified in the header
+    version: u8,
+    /// Name of the vault archive
+    name: String,
+    /// User key initialization vector
+    userkey_iv: [u8; IV_LENGTH],
+    /// Key Region nonce
+    vaultkey_nonce: [u8; AES_NONCE_LENGTH],
+    /// Encrypted VaultKey (includes authentication tag)
+    enc_vaultkey: [u8; VAULTKEY_ENC_LENGTH],
+}
+
+impl HeaderInfo {
+    /// Serialize this header for storage in the vault archive file
+    fn serialize(&self) -> [u8; VAULTHEADER_LENGTH] {
+        let mut header_data = BytesMut::zeroed(VAULTHEADER_LENGTH);
+        header_data.put_u64(VAULT_SIGNATURE);
+        header_data.put_u8(self.version);
+
+        let name_bytes = self.name.as_bytes();
+        header_data.put_slice(name_bytes);
+        // advance because we are using fixed length strings in the format
+        header_data.advance(VAULTNAME_LENGTH - name_bytes.len());
+
+        header_data.put_slice(&self.userkey_iv);
+        header_data.put_slice(&self.enc_vaultkey);
+        header_data.as_array().unwrap().to_owned()
+    }
+
+    /// Get the key encrypted in the header using the supplied password. Uses pbkdf2_hmac to
+    /// generate a key which is then used to decrypt the vault master key
+    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
+        let mut pwd: String = String::new();
+        stdin()
+            .read_line(&mut pwd)
+            .map_err(|e| RetrieveKeyError::StdinError(e))?;
+
+        let user_key = generate_user_key(pwd, &self.userkey_iv);
+        let vault_key =
+            decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
+        vault_key.map_err(|e| RetrieveKeyError::DecryptError(e))
+    }
+
+    /// Read the vault archive file header.
+    /// This expects the Bufreader to be at the start of the file
+    fn build_header(header_data: [u8; VAULTHEADER_LENGTH]) -> Result<Self, ReadHeaderError> {
+        let mut offset = 0;
+        // Check if this file is meant to be a vault archive file
+        let mut signature_buf = [0u8; VAULT_SIGNATURE_LENGTH];
+        signature_buf.copy_from_slice(&header_data[offset..offset+VAULT_SIGNATURE_LENGTH]);
+        let signature = u64::from_be_bytes(signature_buf);
+        offset += VAULT_SIGNATURE_LENGTH;
+
+        if signature != VAULT_SIGNATURE {
+            return Err(ReadHeaderError::InvalidFileError(
+                InvalidFileReasons::WrongSignature,
+            ));
+        }
+
+        //Add a version field for future changes to the vault archive structure
+        let mut version_buf = [0u8; VAULT_VERSION_LENGTH];
+        version_buf.copy_from_slice(&header_data[offset..offset+VAULT_VERSION_LENGTH]);
+        let version = u8::from_be_bytes(version_buf);
+        offset += VAULT_VERSION_LENGTH;
+
+        if version != VAULT_VERSION {
+            return Err(ReadHeaderError::InvalidFileError(
+                InvalidFileReasons::UnsupportedVersion,
+            ));
+        }
+
+        
+        let vaultname = String::from_utf8(header_data[offset..offset+VAULTNAME_LENGTH].to_vec())
+            .map_err(|e| ReadHeaderError::UTF8Error(e))?;
+        offset += VAULTNAME_LENGTH;
+
+        let mut userkey_iv = [0u8; IV_LENGTH];
+        userkey_iv.copy_from_slice(&header_data[offset..offset+IV_LENGTH]);
+        offset += IV_LENGTH;
+
+        //Get the keyregion nonce for decrypting the keyregion
+        let mut key_nonce = [0u8; AES_NONCE_LENGTH];
+        key_nonce.copy_from_slice(&header_data[offset..offset+AES_NONCE_LENGTH]);
+        offset += AES_NONCE_LENGTH;
+
+        let mut encrypted_key = [0u8; VAULTKEY_ENC_LENGTH];
+        encrypted_key.copy_from_slice(&header_data[offset..offset+VAULTKEY_ENC_LENGTH]);
+
+        Ok(HeaderInfo {
+            version,
+            name: vaultname,
+            userkey_iv,
+            vaultkey_nonce: key_nonce,
+            enc_vaultkey: encrypted_key,
+        })
+    }
+}
 
 /// A struct which handles vault changes. Interacts directly with the vault file
 #[derive(Debug)]
 pub struct VaultContext {
     vault_file: File,
     empty_blocks: BlockSet,
+    // TODO decide how to handle key retrieval (should context do it or should it be done by the
+    // manager)
+    // (Probably the manager?)
+    // TODO retrieve secret functions in entries to use context
+    pub header: HeaderInfo
 }
 
 impl VaultContext {
@@ -35,15 +153,21 @@ impl VaultContext {
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
     pub fn new(vault_file: String, key: &[u8]) -> Result<Self, InitVaultContextError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(false)
             .open(&vault_file)
             .map_err(|e| InitVaultContextError::VaultLockError(VaultLockError::FileError(e)))?;
+        let mut header = [0u8; VAULTHEADER_LENGTH];
+        let read_bytes = file.read(&mut header).map_err(|e| InitVaultContextError::ReadHeaderError(ReadHeaderError::FileError(e)))?;
+        if read_bytes < VAULTHEADER_LENGTH {
+            return Err(InitVaultContextError::ReadHeaderError(ReadHeaderError::UnexpectedEOF))
+        }
         let mut context = VaultContext {
             vault_file: file,
             empty_blocks: BlockSet::new(),
+            header: HeaderInfo::build_header(header).map_err(|e| InitVaultContextError::ReadHeaderError(e))?
         };
 
         match context.vault_file.try_lock() {
@@ -475,78 +599,4 @@ impl BlockRange {
             end: std::cmp::max(self.end, other.end),
         }
     }
-}
-
-/// Reads a data block from the data section of the vault archive
-/// the is expected to be instantiated on the vault file
-/// `data_blocK-start` is the offset in bytes from file start to target data block start
-/// The key is the AES-GCM key used to decrypt the file
-/// The nonce is used for AES-GCM encryption
-pub fn read_data_block(
-    reader: &mut BufReader<File>,
-    data_block_start: u64,
-    key: &[u8],
-    nonce: &[u8; AES_NONCE_LENGTH],
-) -> Result<[u8; DATABLOCK_RAW_LENGTH], ReadDataBlockError> {
-    let offset = reader
-        .seek(SeekFrom::Start(data_block_start))
-        .map_err(|e| ReadDataBlockError::FileError(e, 0))?;
-    let enc_data_res = read_field::<DATABLOCK_LENGTH>(reader).map_err(|e| match e {
-        ReadFieldError::UnexpectedEOFError => ReadDataBlockError::UnexpectedEOF(offset),
-        ReadFieldError::FileError(e) => ReadDataBlockError::FileError(e, offset),
-    })?;
-    let data = decrypt_region::<DATABLOCK_RAW_LENGTH>(&enc_data_res, &nonce, key)
-        .map_err(|e| ReadDataBlockError::CryptoError(e))?;
-    Ok(data)
-}
-
-/// Reads a data block of dynamic length from the block section of the vault archive.
-/// data_block_start is the offset in bytes from file start
-/// The key is the AES-GCM key used to decrypt the file
-/// The nonce is used for AES-GCM encryption
-pub fn read_dyn_data_block(
-    reader: &mut BufReader<File>,
-    data_block_start: u64,
-    key: &[u8],
-    nonce: &[u8; AES_NONCE_LENGTH],
-    len: usize,
-) -> Result<Vec<u8>, ReadDataBlockError> {
-    let offset = reader
-        .seek(SeekFrom::Start(data_block_start))
-        .map_err(|e| ReadDataBlockError::FileError(e, 0))?;
-    let enc_data = read_dyn_field(reader, len).map_err(|e| match e {
-        ReadFieldError::UnexpectedEOFError => ReadDataBlockError::UnexpectedEOF(offset),
-        ReadFieldError::FileError(e) => ReadDataBlockError::FileError(e, offset),
-    })?;
-    let data =
-        decrypt_region_dyn(enc_data, nonce, key).map_err(|e| ReadDataBlockError::CryptoError(e))?;
-    Ok(data)
-}
-
-/// Read a field of specific size from a buffered reader and return the contents in a fixed size
-/// array
-pub fn read_field<const length: usize>(
-    reader: &mut BufReader<File>,
-) -> Result<[u8; length], ReadFieldError> {
-    let mut buffer: [u8; length] = [0; length];
-    let read_bytes = reader
-        .read(&mut buffer)
-        .map_err(|e| ReadFieldError::FileError(e))?;
-    if read_bytes < length {
-        return Err(ReadFieldError::UnexpectedEOFError);
-    }
-    Ok(buffer)
-}
-
-/// Reads a field of size only known at compile time and returns the result as a vector of bytes
-pub fn read_dyn_field(reader: &mut BufReader<File>, len: usize) -> Result<Vec<u8>, ReadFieldError> {
-    let mut buffer: Vec<u8> = vec![0; len];
-    let bytes_read = reader
-        .read(&mut buffer)
-        .map_err(|e| ReadFieldError::FileError(e))?;
-    if bytes_read < len {
-        return Err(ReadFieldError::UnexpectedEOFError);
-    }
-
-    Ok(buffer)
 }

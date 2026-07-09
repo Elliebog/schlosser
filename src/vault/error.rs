@@ -1,16 +1,7 @@
 use std::{fs::TryLockError, string::FromUtf8Error};
 
 use crate::{crypt::CryptographyError, vault::utils::VaultPath};
-//TODO Re-evalute if we should not panic more often for a lot of these errors
 
-
-pub enum InvalidFileReasons {
-    WrongSignature,
-    UnsupportedVersion,
-    NoRootEntry,
-    InvalidVaultStructure,
-    UnkownEntryType,
-}
 
 pub enum RetrieveSecretError {
     InvalidDataBlockError(i64),
@@ -26,8 +17,7 @@ pub enum RetrieveSecretError {
 impl From<VaultError> for RetrieveSecretError {
     fn from(value: VaultError) -> Self {
         RetrieveSecretError::VaultError(value)
-    }
-}
+    } }
 
 impl From<ReadDataBlockError> for RetrieveSecretError {
     fn from(value: ReadDataBlockError) -> Self {
@@ -38,8 +28,7 @@ impl From<ReadDataBlockError> for RetrieveSecretError {
 pub enum Operation {
     RetrieveSecret,
     ChangePassword,
-    ChangeSecret,
-}
+    ChangeSecret, }
 
 pub enum EntryType {
     Directory,
@@ -195,5 +184,18 @@ pub enum BuildEntryError {
 
 pub enum InitVaultContextError {
     BuildVaultError(BuildVaultError),
-    VaultLockError(VaultLockError)
+    VaultLockError(VaultLockError),
+    ReadHeaderError(ReadHeaderError)
+}
+
+pub enum ReadHeaderError {
+    FileError(std::io::Error),
+    InvalidFileError(InvalidFileReasons),
+    UTF8Error(FromUtf8Error),
+    UnexpectedEOF,
+}
+
+pub enum InvalidFileReasons {
+    WrongSignature,
+    UnsupportedVersion,
 }

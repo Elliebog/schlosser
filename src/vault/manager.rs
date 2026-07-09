@@ -24,22 +24,8 @@ use std::{
 
 // General Constants
 pub const AES_GCM_AUTH_TAG: usize = 16;
-// Header Constants
-const VAULT_SIGNATURE: u64 = 0x0000e111e0afbaca;
-const VAULT_SIGNATURE_LENGTH: usize = 8;
-const VAULT_VERSION: u8 = 1;
-const VAULT_VERSION_LENGTH: usize = 1;
 pub const VAULTNAME_LENGTH: usize = 128;
-const VAULTKEY_LENGTH: usize = 32;
-const VAULTKEY_ENC_LENGTH: usize = VAULTKEY_LENGTH + AES_GCM_AUTH_TAG;
-const VAULTTABLE_SIZE_LENGTH: usize = 8; //64 bit for u64
-pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
-    + VAULT_VERSION_LENGTH
-    + VAULTNAME_LENGTH
-    + IV_LENGTH
-    + AES_NONCE_LENGTH
-    + VAULTKEY_LENGTH;
-
+//
 // Vault Table Constants
 pub const ENTRYTYPE_LENGTH: usize = 1;
 pub(crate) const PASSWORDENTRY_TYPE: u8 = 0;
@@ -58,12 +44,8 @@ pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH;
 /// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
 pub struct VaultManager {
-    /// Info regarding the header section
-    header: HeaderInfo,
     /// The root vault entry
     root_entry: DirectoryEntry,
-    /// The path to the archive file
-    vault_path: String,
     /// internal context for tracking changes to the vault
     context: VaultContext,
 }
@@ -301,129 +283,7 @@ impl DataBlockChange {
     }
 }
 
-/// Header Information of the archive file
-#[derive(Debug)]
-struct HeaderInfo {
-    /// Version specified in the header
-    version: u8,
-    /// Name of the vault archive
-    name: String,
-    /// User key initialization vector
-    userkey_iv: [u8; IV_LENGTH],
-    /// Key Region nonce
-    vaultkey_nonce: [u8; AES_NONCE_LENGTH],
-    /// Encrypted VaultKey (includes authentication tag)
-    enc_vaultkey: [u8; VAULTKEY_ENC_LENGTH],
-    /// Size of the vault table
-    vault_table_size: u64,
-    /// Nonce used for encrypting the vault table
-    vault_table_nonce: [u8; AES_NONCE_LENGTH],
-}
 
-impl HeaderInfo {
-    /// Serialize this header for storage in the vault archive file
-    fn serialize(&self) -> [u8; HEADER_LENGTH] {
-        let mut header_data = BytesMut::zeroed(HEADER_LENGTH);
-        header_data.put_u64(VAULT_SIGNATURE);
-        header_data.put_u8(self.version);
-
-        let name_bytes = self.name.as_bytes();
-        header_data.put_slice(name_bytes);
-        // advance because we are using fixed length strings in the format
-        header_data.advance(VAULTNAME_LENGTH - name_bytes.len());
-
-        header_data.put_slice(&self.userkey_iv);
-        header_data.put_slice(&self.enc_vaultkey);
-        header_data.put_u64(self.vault_table_size);
-        header_data.put_slice(&self.vault_table_nonce);
-        header_data.as_array().unwrap().to_owned()
-    }
-
-    /// Get the key encrypted in the header using the supplied password. Uses pbkdf2_hmac to
-    /// generate a key which is then used to decrypt the vault master key
-    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
-        let mut pwd: String = String::new();
-        stdin()
-            .read_line(&mut pwd)
-            .map_err(|e| RetrieveKeyError::StdinError(e))?;
-
-        let user_key = generate_user_key(pwd, &self.userkey_iv);
-        let vault_key =
-            decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
-        vault_key.map_err(|e| RetrieveKeyError::DecryptError(e))
-    }
-
-    /// Read the vault archive file header.
-    /// This expects the Bufreader to be at the start of the file
-    fn build_header(reader: &mut BufReader<File>) -> Result<Self, ReadVaultFileError> {
-        let mut offset: u64 = 0;
-        // Check if this file is meant to be a vault archive file
-        let signature = u64::from_be_bytes(
-            read_field::<VAULT_SIGNATURE_LENGTH>(reader)
-                .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?,
-        );
-        offset += VAULT_SIGNATURE_LENGTH as u64;
-
-        if signature != VAULT_SIGNATURE {
-            return Err(ReadVaultFileError::InvalidFile(
-                InvalidFileReasons::WrongSignature,
-            ));
-        }
-
-        //Add a version field for future changes to the vault archive structure
-        let version = read_field::<VAULT_VERSION_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?[0];
-        offset += VAULT_VERSION_LENGTH as u64;
-
-        if version != VAULT_VERSION {
-            return Err(ReadVaultFileError::InvalidFile(
-                InvalidFileReasons::UnsupportedVersion,
-            ));
-        }
-
-        let vaultname_raw = read_field::<VAULTNAME_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-        let vaultname = String::from_utf8(vaultname_raw.to_vec())
-            .map_err(|e| ReadVaultFileError::UTF8Error(e, offset))?;
-        offset += VAULTNAME_LENGTH as u64;
-
-        let userkey_iv = read_field::<IV_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-        offset += IV_LENGTH as u64;
-
-        //Get the keyregion nonce for decrypting the keyregion
-        let keyregion_nonce = read_field::<AES_NONCE_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-
-        offset += AES_NONCE_LENGTH as u64;
-
-        let keyarr = read_field::<VAULTKEY_ENC_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-        offset += VAULTKEY_ENC_LENGTH as u64;
-
-        let vaulttable_size = read_field::<VAULTTABLE_SIZE_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-        offset += VAULTTABLE_SIZE_LENGTH as u64;
-
-        let vault_nonce = read_field::<AES_NONCE_LENGTH>(reader)
-            .map_err(|e| ReadVaultFileError::ReadFieldError(e, offset))?;
-
-        Ok(HeaderInfo {
-            version,
-            name: vaultname,
-            userkey_iv,
-            vaultkey_nonce: keyregion_nonce,
-            enc_vaultkey: keyarr,
-            vault_table_size: u64::from_be_bytes(vaulttable_size),
-            vault_table_nonce: vault_nonce,
-        })
-    }
-
-    /// Calculate the offset of the datablock section
-    fn calculate_data_start(&self) -> u64 {
-        HEADER_LENGTH as u64 + self.vault_table_size * VAULTENTRY_LENGTH as u64
-    }
-}
 
 /// Read the vault table using an iterative approach
 /// Returns the root entry as a directory
