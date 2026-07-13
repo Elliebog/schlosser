@@ -45,10 +45,7 @@ pub struct VaultManager {
 
 impl VaultManager {
     pub fn from_file(file_path: String) -> Result<VaultManager, InitVaultContextError> {
-        let (context, root, header) = VaultContext::new(file_path)?;
-        let mut key = header
-            .retrieve_key()
-            .map_err(|e| InitVaultContextError::RetrieveKeyError(e))?;
+        let (context, root, header, mut key) = VaultContext::new(file_path)?;
         let mut enc_mem = EncryptedMem::new();
         enc_mem
             .encrypt(&key)

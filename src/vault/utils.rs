@@ -1,14 +1,14 @@
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io::{BufReader, Read, Seek, SeekFrom, Write, stdin},
+    io::{Read, Seek, SeekFrom, Write, stdin},
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use zeroize::Zeroize;
 
 use crate::{
     crypt::{
-        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn,
+        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region,
         generate_user_key,
     },
     vault::{
@@ -158,7 +158,7 @@ impl VaultContext {
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
     pub fn new(
         vault_file: String,
-    ) -> Result<(Self, DirectoryEntry, HeaderInfo), InitVaultContextError> {
+    ) -> Result<(Self, DirectoryEntry, HeaderInfo, [u8; KEY_LENGTH]), InitVaultContextError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let mut file = OpenOptions::new()
             .read(true)
@@ -188,7 +188,7 @@ impl VaultContext {
                     .map_err(|e| InitVaultContextError::BuildVaultError(e))?;
                 context.empty_blocks = root.occupied_datablocks().get_empty_space();
                 key.zeroize(); 
-                Ok((context, root, header))
+                Ok((context, root, header, key))
             }
             Err(TryLockError::WouldBlock) => Err(InitVaultContextError::VaultLockError(
                 VaultLockError::VaultBusy,
