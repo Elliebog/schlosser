@@ -713,7 +713,7 @@ impl DirectoryEntry {
         key: &[u8],
         context: &mut VaultContext,
     ) -> Result<Self, VaultChangeError> {
-        if dir_name.len() > VAULTNAME_LENGTH {
+        if dir_name.len() > VAULTENTRYNAME_LENGTH {
             Err(VaultChangeError::ExceededNameLength(
                 NameLengthExceededError {
                     len: dir_name.len(),
@@ -724,7 +724,7 @@ impl DirectoryEntry {
             namebuf.put_slice(dir_name.as_bytes());
 
             let mut entry = DirectoryEntry {
-                name: *namebuf.freeze().as_array().unwrap(),
+                name: *namebuf.as_array().unwrap(),
                 block: 0,
                 next: -1,
                 first_child: -1,
@@ -740,6 +740,19 @@ impl DirectoryEntry {
                 .map_err(|e| VaultChangeError::FileChangeError(e))?;
             entry.block = block.start;
             Ok(entry)
+        }
+    }
+
+    pub fn init_root() -> DirectoryEntry {
+        let mut namebuf = BytesMut::zeroed(VAULTENTRYNAME_LENGTH);
+        namebuf.put_slice("root".as_bytes());
+        DirectoryEntry {
+            name: *namebuf.as_array().unwrap(),
+            block: 0,
+            next: -1, 
+            first_child: -1,
+            children: Vec::new(),
+            map: HashMap::new(),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::{fs::TryLockError, string::FromUtf8Error};
+use std::{string::FromUtf8Error};
 
 use memsecurity::MemSecurityErr;
 
@@ -10,7 +10,6 @@ pub enum RetrieveSecretError {
     VaultFileError(VaultFileError),
     DecryptError(CryptographyError)
 }
-
 pub enum RetrieveEntryError {
     InvalidOperation(Operation, EntryType),
     SecretError(RetrieveSecretError),
@@ -130,7 +129,7 @@ pub enum VaultError {
 
 pub enum RetrieveKeyError {
     StdinError(std::io::Error),
-    DecryptError(CryptographyError),
+    CryptError(CryptographyError),
 }
 
 pub enum SaveVaultError {
@@ -175,7 +174,7 @@ pub enum InitVaultContextError {
     VaultLockError(VaultLockError),
     ReadHeaderError(ReadHeaderError),
     RetrieveKeyError(RetrieveKeyError),
-    EncryptedMemError(MemSecurityErr)
+    EncryptedMemError(MemSecurityErr),
 }
 
 pub enum ReadHeaderError {
@@ -188,4 +187,13 @@ pub enum ReadHeaderError {
 pub enum InvalidFileReasons {
     WrongSignature,
     UnsupportedVersion,
+}
+
+pub enum CreateVaultContextError {
+    NewVaultFileError(std::io::Error),
+    KeyError(RetrieveKeyError),
+    SerializationError(SerializationError),
+    InitVaultContextError(InitVaultContextError),
+    InitVaultFileError(std::io::Error),
+    EncryptedMemError(MemSecurityErr)
 }

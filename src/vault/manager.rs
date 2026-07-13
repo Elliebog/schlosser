@@ -1,14 +1,13 @@
 use memsecurity::EncryptedMem;
 use zeroize::Zeroize;
 
-use crate::crypt::{KEY_LENGTH};
+use crate::crypt::KEY_LENGTH;
 use crate::vault::entry::{
     DirectoryEntry, EncryptedEntry, Entry, EntryResult, PasswordEntry, SecretFileEntry, VaultEntry,
 };
 use crate::vault::error::{
-    DeleteEntryError, EntryType, InitVaultContextError, NewEntryError,
-    Operation, RenameEntryError, RetrieveEntryError,
-    VaultChangeEntryError,
+    CreateVaultContextError, DeleteEntryError, EntryType, InitVaultContextError, NewEntryError,
+    Operation, RenameEntryError, RetrieveEntryError, VaultChangeEntryError,
 };
 use crate::vault::utils::{BlockSet, VaultContext, VaultPath};
 
@@ -34,7 +33,7 @@ pub const NEXT_OFFSET: usize = ENTRYTYPE_LENGTH;
 /// Maint Entry point that manages vault information about a schlosser vault
 #[derive(Debug)]
 pub struct VaultManager {
-    /// Name of the vault
+    /// Name of the vault (the file path without the ending)
     name: String,
     vaultkey: EncryptedMem,
     /// The root vault entry
@@ -44,15 +43,29 @@ pub struct VaultManager {
 }
 
 impl VaultManager {
-    pub fn from_file(file_path: String) -> Result<VaultManager, InitVaultContextError> {
-        let (context, root, header, mut key) = VaultContext::new(file_path)?;
+    pub fn init(file_path: String) -> Result<VaultManager, CreateVaultContextError> {
+        let (context, root, mut key) = VaultContext::init(file_path.clone())?;
         let mut enc_mem = EncryptedMem::new();
         enc_mem
             .encrypt(&key)
-            .map_err(|e| InitVaultContextError::EncryptedMemError(e))?;
+            .map_err(CreateVaultContextError::EncryptedMemError)?;
         key.zeroize();
         Ok(VaultManager {
-            name: header.get_name(),
+            name: file_path,
+            vaultkey: enc_mem,
+            root,
+            context,
+        })
+    }
+    pub fn from_file(file_path: String) -> Result<VaultManager, InitVaultContextError> {
+        let (context, root, mut key) = VaultContext::from_file(file_path.clone())?;
+        let mut enc_mem = EncryptedMem::new();
+        enc_mem
+            .encrypt(&key)
+            .map_err(InitVaultContextError::EncryptedMemError)?;
+        key.zeroize();
+        Ok(VaultManager {
+            name: file_path,
             vaultkey: enc_mem,
             root,
             context,
@@ -60,7 +73,7 @@ impl VaultManager {
     }
 
     pub fn get_vault_info(&self) -> Result<String, std::fmt::Error> {
-        let mut out: String = format!("{} Archive", self.name);
+        let mut out: String = format!("Archive at: {}", self.name);
         self.root.get_directory_overview(0, &mut out)?;
 
         Ok(out)
@@ -68,24 +81,23 @@ impl VaultManager {
 
     fn retrieve_secret_entry(
         &mut self,
-        entry_path: &String,
+        entry_path: &str,
     ) -> Result<EntryResult, RetrieveEntryError> {
-        let path = VaultPath::new(entry_path.clone())
-            .map_err(|e| RetrieveEntryError::InvalidVaultPath(e))?;
+        let path = VaultPath::new(entry_path.to_owned())
+            .map_err(RetrieveEntryError::InvalidVaultPath)?;
         let target_entry = self
             .root
             .get_entry(path.parts().into(), &path)
-            .map_err(|e| RetrieveEntryError::GetEntryError(e))?;
+            .map_err(RetrieveEntryError::GetEntryError)?;
         // The keys dont need to be zeroized after this operation as it is done automatically due to
         // it being ZeroizeBytes
         let temp_key = self
             .vaultkey
             .decrypt()
-            .map_err(|e| RetrieveEntryError::RetrieveKeyError(e))?;
+            .map_err(RetrieveEntryError::RetrieveKeyError)?;
         let key = temp_key.expose_borrowed().as_array::<KEY_LENGTH>().unwrap();
 
-        let res = target_entry.retrieve_secret(&mut self.context, key);
-        res
+       target_entry.retrieve_secret(&mut self.context, key)
     }
 
     /// Returns a list of empty data blocks in the vault archive
@@ -256,7 +268,13 @@ impl VaultManager {
 
         let res = self
             .root
-            .new_entry(path.parts().into(), &path, VaultEntry::Password(password), &mut self.context, key)
+            .new_entry(
+                path.parts().into(),
+                &path,
+                VaultEntry::Password(password),
+                &mut self.context,
+                key,
+            )
             .map_err(|e| NewEntryError::VaultError(e));
         res
     }

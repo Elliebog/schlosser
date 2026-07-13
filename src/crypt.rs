@@ -1,11 +1,8 @@
 use std::{fs::File, io::Read};
 
-use crate::{
-    vault::manager::{AES_GCM_AUTH_TAG, DATABLOCK_LENGTH},
-};
+use crate::vault::{manager::{AES_GCM_AUTH_TAG, DATABLOCK_LENGTH}, utils::VAULTKEY_ENC_LENGTH};
 use aes_gcm::{
-    AeadCore, Aes256Gcm, Error, Key, KeyInit,
-    aead::{Aead, OsRng},
+    Aes256Gcm, Key, KeyInit, Nonce, aead::{Aead, Generate}
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use pbkdf2::pbkdf2_hmac_array;
@@ -45,6 +42,12 @@ pub fn generate_user_key(password: String, iv: &[u8; IV_LENGTH]) -> [u8; KEY_LEN
     pbkdf2_hmac_array::<Sha256, KEY_LENGTH>(password.as_bytes(), iv, PBKDF2_ITERATIONS as u32)
 }
 
+pub fn generate_vault_key() -> [u8; KEY_LENGTH] {
+    // A conversion between typenum and const generics can be done with hybrid arrays easily if the
+    // lengths match
+    Key::<Aes256Gcm>::generate().try_into().unwrap()
+}
+
 /// Decrypt a region where N is the target amount of bytes (excluding authentication tag).
 /// This function uses experimental features such as computations with const generics
 pub fn decrypt_region<const N: usize>(
@@ -52,8 +55,8 @@ pub fn decrypt_region<const N: usize>(
     nonce: &[u8; AES_NONCE_LENGTH],
     key: &[u8],
 ) -> Result<[u8; N], CryptographyError> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
+    let key = Key::<Aes256Gcm>::try_from(key).unwrap();
+    let cipher = Aes256Gcm::new(&key);
 
     //Decrypt the target data and truncate to exclude the authentication tag
     let mut data = cipher
@@ -75,8 +78,8 @@ pub fn decrypt_region_dyn(
     nonce: &[u8; AES_NONCE_LENGTH],
     key: &[u8],
 ) -> Result<Vec<u8>, CryptographyError> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
+    let key = Key::<Aes256Gcm>::try_from(key).unwrap();
+    let cipher = Aes256Gcm::new(&key);
 
     let data = cipher
         .decrypt(nonce.into(), &data[..])
@@ -87,9 +90,9 @@ pub fn decrypt_region_dyn(
 }
 
 pub fn encrypt_dyn_region(data: Bytes, key: &[u8]) -> Result<EncryptedData, CryptographyError> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let key = Key::<Aes256Gcm>::try_from(key).unwrap();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::generate();
     let encrypted_data = cipher
         .encrypt(&nonce, &data[..])
         .map_err(|e| CryptographyError {message: e.to_string()})?;
@@ -106,10 +109,10 @@ pub fn encrypt_dyn_region(data: Bytes, key: &[u8]) -> Result<EncryptedData, Cryp
 pub fn encrypt_region<const N: usize>(
     data: &[u8; N],
     key: &[u8],
-) -> Result<EncryptedDataArr<{ N + 16 }>, CryptographyError> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+) -> Result<EncryptedDataArr<{ N + AES_GCM_AUTH_TAG }>, CryptographyError> {
+    let key = Key::<Aes256Gcm>::try_from(key).unwrap();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::generate();
     let encrypted_data = cipher
         .encrypt(&nonce, &data[..])
         .map_err(|e| CryptographyError { message: e.to_string() })?;

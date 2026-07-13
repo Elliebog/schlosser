@@ -4,23 +4,23 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
+use memsecurity::rand_core::{OsRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::{
     crypt::{
-        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region,
-        generate_user_key,
+        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, encrypt_region,
+        generate_user_key, generate_vault_key,
     },
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
-            FileChangeError, InitVaultContextError, InvalidFileReasons, InvalidVaultPathError,
-            ReadHeaderError, RetrieveKeyError, SeekFileError,
+            CreateVaultContextError, FileChangeError, InitVaultContextError, InvalidFileReasons,
+            InvalidVaultPathError, ReadHeaderError, RetrieveKeyError, SeekFileError,
             VaultFileError, VaultLockError,
         },
         manager::{
-            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH,
-            ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTNAME_LENGTH,
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, ENTRYTYPE_LENGTH, NEXT_OFFSET,
         },
     },
 };
@@ -33,10 +33,9 @@ const VAULT_SIGNATURE_LENGTH: usize = 8;
 const VAULT_VERSION: u8 = 1;
 const VAULT_VERSION_LENGTH: usize = 1;
 
-const VAULTKEY_ENC_LENGTH: usize = KEY_LENGTH + AES_GCM_AUTH_TAG;
+pub const VAULTKEY_ENC_LENGTH: usize = KEY_LENGTH + AES_GCM_AUTH_TAG;
 pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + VAULT_VERSION_LENGTH
-    + VAULTNAME_LENGTH
     + IV_LENGTH
     + AES_NONCE_LENGTH
     + VAULTKEY_ENC_LENGTH;
@@ -46,8 +45,6 @@ pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
 pub struct HeaderInfo {
     /// Version specified in the header
     version: u8,
-    /// Name of the vault archive
-    name: [u8; VAULTNAME_LENGTH],
     /// User key initialization vector
     userkey_iv: [u8; IV_LENGTH],
     /// Key Region nonce
@@ -57,12 +54,30 @@ pub struct HeaderInfo {
 }
 
 impl HeaderInfo {
+    fn init_header() -> Result<(HeaderInfo, [u8; KEY_LENGTH]), RetrieveKeyError> {
+        let mut passwd = String::new();
+        stdin().read_line(&mut passwd).map_err(RetrieveKeyError::StdinError)?;
+        let mut userkey_iv = [0u8; IV_LENGTH];
+        OsRng.fill_bytes(&mut userkey_iv);
+
+        let key = generate_user_key(passwd, &userkey_iv);
+        let raw_vaultkey = generate_vault_key();
+        let vaultkey = encrypt_region(&raw_vaultkey, &key).map_err(RetrieveKeyError::CryptError)?;
+        Ok((
+            HeaderInfo {
+                version: VAULT_VERSION,
+                userkey_iv,
+                vaultkey_nonce: vaultkey.nonce,
+                enc_vaultkey: vaultkey.data,
+            },
+            raw_vaultkey,
+        ))
+    }
     /// Serialize this header for storage in the vault archive file
     fn serialize(&self) -> [u8; VAULTHEADER_LENGTH] {
         let mut header_data = BytesMut::zeroed(VAULTHEADER_LENGTH);
         header_data.put_u64(VAULT_SIGNATURE);
         header_data.put_u8(self.version);
-        header_data.put_slice(&self.name);
         header_data.put_slice(&self.userkey_iv);
         header_data.put_slice(&self.enc_vaultkey);
         header_data.as_array().unwrap().to_owned()
@@ -74,12 +89,12 @@ impl HeaderInfo {
         let mut pwd: String = String::new();
         stdin()
             .read_line(&mut pwd)
-            .map_err(|e| RetrieveKeyError::StdinError(e))?;
+            .map_err(RetrieveKeyError::StdinError)?;
 
         let user_key = generate_user_key(pwd, &self.userkey_iv);
         let vault_key =
             decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
-        vault_key.map_err(|e| RetrieveKeyError::DecryptError(e))
+        vault_key.map_err(RetrieveKeyError::CryptError)
     }
 
     /// Read the vault archive file header.
@@ -110,13 +125,6 @@ impl HeaderInfo {
             ));
         }
 
-        // Perform UTF8 Check to be sure no attacker is trying smth funny
-        let mut vaultname_buf = BytesMut::zeroed(VAULTNAME_LENGTH);
-        let vaultname = String::from_utf8(header_data[offset..offset+VAULTNAME_LENGTH].to_vec())
-            .map_err(|e| ReadHeaderError::UTF8Error(e))?;
-        vaultname_buf.put_slice(vaultname.as_bytes());
-        offset += VAULTNAME_LENGTH;
-
         let mut userkey_iv = [0u8; IV_LENGTH];
         userkey_iv.copy_from_slice(&header_data[offset..offset + IV_LENGTH]);
         offset += IV_LENGTH;
@@ -131,15 +139,10 @@ impl HeaderInfo {
 
         Ok(HeaderInfo {
             version,
-            name: *vaultname_buf.as_array().unwrap(),
             userkey_iv,
             vaultkey_nonce: key_nonce,
             enc_vaultkey: encrypted_key,
         })
-    }
-
-    pub fn get_name(&self) -> String {
-       String::from_utf8(self.name.to_vec()).unwrap()
     }
 }
 
@@ -151,14 +154,43 @@ pub struct VaultContext {
 }
 
 impl VaultContext {
+    /// Creates a new empty VaultContext
+    pub fn init(
+        vault_file: String,
+    ) -> Result<(Self, DirectoryEntry, [u8; KEY_LENGTH]), CreateVaultContextError> {
+        // create basic elements of a file (header and root)
+        let root = DirectoryEntry::init_root();
+        let (header, mut vaultkey) =
+            HeaderInfo::init_header().map_err(CreateVaultContextError::KeyError)?;
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(false)
+            .create_new(true)
+            .open(&vault_file)
+            .map_err(CreateVaultContextError::NewVaultFileError)?;
+        file.write_all(&header.serialize())
+            .map_err(CreateVaultContextError::InitVaultFileError)?;
+        file.write_all(
+            &root
+                .serialize(&vaultkey)
+                .map_err(CreateVaultContextError::SerializationError)?,
+        )
+        .map_err(CreateVaultContextError::InitVaultFileError)?;
+        std::mem::drop(file);
+        vaultkey.zeroize();
+        VaultContext::from_file(vault_file).map_err(CreateVaultContextError::InitVaultContextError)
+    }
+
     /// Create a new Vaultcontext from a vaultfile
     /// This function establishes the lock on the vaultfile and also returns the root Directory
     /// because this function needs to establish a collection of empty blocks for vault changes
     /// Empty blocks can only be calculated using an a root directory
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
-    pub fn new(
+    pub fn from_file(
         vault_file: String,
-    ) -> Result<(Self, DirectoryEntry, HeaderInfo, [u8; KEY_LENGTH]), InitVaultContextError> {
+    ) -> Result<(Self, DirectoryEntry, [u8; KEY_LENGTH]), InitVaultContextError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let mut file = OpenOptions::new()
             .read(true)
@@ -182,13 +214,15 @@ impl VaultContext {
                     empty_blocks: BlockSet::new(),
                 };
                 let header = HeaderInfo::build_header(header)
-                        .map_err(|e| InitVaultContextError::ReadHeaderError(e))?;
-                let mut key = header.retrieve_key().map_err(|e| InitVaultContextError::RetrieveKeyError(e))?; 
+                    .map_err(InitVaultContextError::ReadHeaderError)?;
+                let mut key = header
+                    .retrieve_key()
+                    .map_err(InitVaultContextError::RetrieveKeyError)?;
                 let root = DirectoryEntry::build_entry_rec(0, &mut context, &key)
-                    .map_err(|e| InitVaultContextError::BuildVaultError(e))?;
+                    .map_err(InitVaultContextError::BuildVaultError)?;
                 context.empty_blocks = root.occupied_datablocks().get_empty_space();
-                key.zeroize(); 
-                Ok((context, root, header, key))
+                key.zeroize();
+                Ok((context, root, key))
             }
             Err(TryLockError::WouldBlock) => Err(InitVaultContextError::VaultLockError(
                 VaultLockError::VaultBusy,
@@ -204,11 +238,13 @@ impl VaultContext {
     /// Assumes that the block is an entry block
     pub fn change_next(&mut self, block: u64, new_value: i64) -> Result<(), FileChangeError> {
         self.jump_to_block(block)
-            .map_err(|e| FileChangeError::SeekFileError(e))?;
+            .map_err(FileChangeError::SeekFileError)?;
         self.vault_file
             .seek(SeekFrom::Current(NEXT_OFFSET as i64))
-            .map_err(|e| FileChangeError::FileError(e));
-        self.vault_file.write(&new_value.to_be_bytes());
+            .map_err(FileChangeError::FileError)?;
+        self.vault_file
+            .write_all(&new_value.to_be_bytes())
+            .map_err(FileChangeError::FileError)?;
         Ok(())
     }
 
@@ -218,18 +254,20 @@ impl VaultContext {
     /// If shrinking/growing is needed use [`change_dyn_data`]
     pub fn change_data(&mut self, block: u64, data: Bytes) -> Result<(), FileChangeError> {
         self.jump_to_block(block)
-            .map_err(|e| FileChangeError::SeekFileError(e))?;
-        if data.len() % DATABLOCK_LENGTH != 0 {
+            .map_err(FileChangeError::SeekFileError)?;
+        if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
-        self.vault_file.write(&data);
+        self.vault_file
+            .write_all(&data)
+            .map_err(FileChangeError::FileError)?;
         Ok(())
     }
 
     /// Create a new block with size determined by the amount of bytes in data (has to be a multiple
     /// of DATABLOCK_LENGTH)
     pub fn new_block(&mut self, data: Bytes) -> Result<BlockRange, FileChangeError> {
-        if data.len() % DATABLOCK_LENGTH != 0 {
+        if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
 
@@ -240,17 +278,19 @@ impl VaultContext {
         let file_end = self
             .vault_file
             .seek(SeekFrom::End(0))
-            .map_err(|e| FileChangeError::FileError(e))?;
+            .map_err(FileChangeError::FileError)?;
 
         if offset >= file_end {
-            self.vault_file.write(&data);
+            self.vault_file
+                .write(&data)
+                .map_err(FileChangeError::FileError)?;
         } else {
             self.vault_file
                 .seek(SeekFrom::Start(offset))
-                .map_err(|e| FileChangeError::FileError(e))?;
+                .map_err(FileChangeError::FileError)?;
             self.vault_file
                 .write(&data)
-                .map_err(|e| FileChangeError::FileError(e))?;
+                .map_err(FileChangeError::FileError)?;
         }
         Ok(new_block)
     }
@@ -259,9 +299,11 @@ impl VaultContext {
     /// Blockset
     pub fn delete_block(&mut self, block: BlockRange) -> Result<(), FileChangeError> {
         self.jump_to_block(block.start)
-            .map_err(|e| FileChangeError::SeekFileError(e))?;
+            .map_err(FileChangeError::SeekFileError)?;
         let new_data = BytesMut::zeroed(block.len() * DATABLOCK_LENGTH);
-        self.vault_file.write(&new_data.freeze());
+        self.vault_file
+            .write(&new_data.freeze())
+            .map_err(FileChangeError::FileError)?;
         self.empty_blocks.put(block);
         Ok(())
     }
@@ -274,22 +316,22 @@ impl VaultContext {
         old_block: BlockRange,
         data: Bytes,
     ) -> Result<Option<BlockRange>, FileChangeError> {
-        if data.len() % DATABLOCK_LENGTH != 0 {
+        if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
 
         let block_len = data.len() / DATABLOCK_LENGTH;
         if block_len == old_block.len() {
-            self.change_data(old_block.start, data);
+            self.change_data(old_block.start, data)?;
             Ok(None)
         } else if block_len > old_block.len() {
             //mark old as empty
             self.delete_block(old_block)?;
-            self.new_block(data).map(|e| Some(e))
+            self.new_block(data).map(Some)
         } else {
             let diff = old_block.len() - block_len;
-            self.delete_block(BlockRange::new(old_block.start + block_len as u64, diff));
-            self.change_data(old_block.start, data);
+            self.delete_block(BlockRange::new(old_block.start + block_len as u64, diff))?;
+            self.change_data(old_block.start, data)?;
             Ok(Some(BlockRange::new(old_block.start, block_len)))
         }
     }
@@ -298,12 +340,12 @@ impl VaultContext {
     /// returns an error on io failures or unexpected EOF or Invalid datablock ids
     pub fn read_datablock(&mut self, block: u64) -> Result<[u8; DATABLOCK_LENGTH], VaultFileError> {
         self.jump_to_block(block)
-            .map_err(|e| VaultFileError::SeekFileError(e))?;
+            .map_err(VaultFileError::SeekFileError)?;
         let mut buf = [0u8; DATABLOCK_LENGTH];
         let bytes_read = self
             .vault_file
             .read(&mut buf)
-            .map_err(|e| VaultFileError::FileError(e))?;
+            .map_err(VaultFileError::FileError)?;
         if bytes_read < DATABLOCK_LENGTH {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -315,12 +357,12 @@ impl VaultContext {
     /// returns an error on io failures, unexpected EOF or invalid datablock ids
     pub fn read_dyn_datablock(&mut self, block: BlockRange) -> Result<Bytes, VaultFileError> {
         self.jump_to_block(block.start)
-            .map_err(|e| VaultFileError::SeekFileError(e))?;
+            .map_err(VaultFileError::SeekFileError)?;
         let mut bytes = BytesMut::zeroed(DATABLOCK_LENGTH * block.len());
         let bytes_read = self
             .vault_file
             .read(&mut bytes)
-            .map_err(|e| VaultFileError::FileError(e))?;
+            .map_err(VaultFileError::FileError)?;
         if bytes_read < DATABLOCK_LENGTH * block.len() {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -332,12 +374,12 @@ impl VaultContext {
     /// returns an error on io failures, unexpected EOF or invalid datablock ids
     pub fn read_entry(&mut self, block: u64) -> Result<DataBlockEntry, VaultFileError> {
         self.jump_to_block(block)
-            .map_err(|e| VaultFileError::SeekFileError(e))?;
+            .map_err(VaultFileError::SeekFileError)?;
         let mut buf = [0u8; DATABLOCK_LENGTH];
         let bytes_read = self
             .vault_file
             .read(&mut buf)
-            .map_err(|e| VaultFileError::FileError(e))?;
+            .map_err(VaultFileError::FileError)?;
         if bytes_read < DATABLOCK_LENGTH {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -375,17 +417,12 @@ impl VaultContext {
         let file_len = self
             .vault_file
             .seek(SeekFrom::End(0))
-            .map_err(|e| SeekFileError::FileError(e))? as u64;
-
+            .map_err(SeekFileError::FileError)?;
         if file_len < block_offset {
             Err(SeekFileError::BlockNotFound(block))
         } else {
             Ok(())
         }
-    }
-
-    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
-        self.header.retrieve_key()
     }
 }
 
@@ -584,7 +621,7 @@ pub struct BlockRange {
 
 impl PartialOrd for BlockRange {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.start.partial_cmp(&other.start)
+        Some(self.cmp(other))
     }
 }
 
