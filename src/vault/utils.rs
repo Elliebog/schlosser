@@ -4,16 +4,23 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use zeroize::Zeroize;
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn, generate_user_key},
+    crypt::{
+        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, decrypt_region_dyn,
+        generate_user_key,
+    },
     vault::{
         entry::{DirectoryEntry, Entry},
         error::{
-            FileChangeError, InitVaultContextError, InvalidFileReasons, InvalidVaultPathError, ReadDataBlockError, ReadFieldError, ReadHeaderError, RetrieveKeyError, SeekFileError, VaultFileError, VaultLockError
+            FileChangeError, InitVaultContextError, InvalidFileReasons, InvalidVaultPathError,
+            ReadHeaderError, RetrieveKeyError, SeekFileError,
+            VaultFileError, VaultLockError,
         },
         manager::{
-            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH, ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTNAME_LENGTH
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH,
+            ENTRYTYPE_LENGTH, NEXT_OFFSET, VAULTNAME_LENGTH,
         },
     },
 };
@@ -34,14 +41,13 @@ pub const VAULTHEADER_LENGTH: usize = VAULT_SIGNATURE_LENGTH
     + AES_NONCE_LENGTH
     + VAULTKEY_ENC_LENGTH;
 
-
 /// Header Information of the archive file
 #[derive(Debug)]
-struct HeaderInfo {
+pub struct HeaderInfo {
     /// Version specified in the header
     version: u8,
     /// Name of the vault archive
-    name: String,
+    name: [u8; VAULTNAME_LENGTH],
     /// User key initialization vector
     userkey_iv: [u8; IV_LENGTH],
     /// Key Region nonce
@@ -56,12 +62,7 @@ impl HeaderInfo {
         let mut header_data = BytesMut::zeroed(VAULTHEADER_LENGTH);
         header_data.put_u64(VAULT_SIGNATURE);
         header_data.put_u8(self.version);
-
-        let name_bytes = self.name.as_bytes();
-        header_data.put_slice(name_bytes);
-        // advance because we are using fixed length strings in the format
-        header_data.advance(VAULTNAME_LENGTH - name_bytes.len());
-
+        header_data.put_slice(&self.name);
         header_data.put_slice(&self.userkey_iv);
         header_data.put_slice(&self.enc_vaultkey);
         header_data.as_array().unwrap().to_owned()
@@ -69,7 +70,7 @@ impl HeaderInfo {
 
     /// Get the key encrypted in the header using the supplied password. Uses pbkdf2_hmac to
     /// generate a key which is then used to decrypt the vault master key
-    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
+    pub fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
         let mut pwd: String = String::new();
         stdin()
             .read_line(&mut pwd)
@@ -87,7 +88,7 @@ impl HeaderInfo {
         let mut offset = 0;
         // Check if this file is meant to be a vault archive file
         let mut signature_buf = [0u8; VAULT_SIGNATURE_LENGTH];
-        signature_buf.copy_from_slice(&header_data[offset..offset+VAULT_SIGNATURE_LENGTH]);
+        signature_buf.copy_from_slice(&header_data[offset..offset + VAULT_SIGNATURE_LENGTH]);
         let signature = u64::from_be_bytes(signature_buf);
         offset += VAULT_SIGNATURE_LENGTH;
 
@@ -99,7 +100,7 @@ impl HeaderInfo {
 
         //Add a version field for future changes to the vault archive structure
         let mut version_buf = [0u8; VAULT_VERSION_LENGTH];
-        version_buf.copy_from_slice(&header_data[offset..offset+VAULT_VERSION_LENGTH]);
+        version_buf.copy_from_slice(&header_data[offset..offset + VAULT_VERSION_LENGTH]);
         let version = u8::from_be_bytes(version_buf);
         offset += VAULT_VERSION_LENGTH;
 
@@ -109,30 +110,36 @@ impl HeaderInfo {
             ));
         }
 
-        
+        // Perform UTF8 Check to be sure no attacker is trying smth funny
+        let mut vaultname_buf = BytesMut::zeroed(VAULTNAME_LENGTH);
         let vaultname = String::from_utf8(header_data[offset..offset+VAULTNAME_LENGTH].to_vec())
             .map_err(|e| ReadHeaderError::UTF8Error(e))?;
+        vaultname_buf.put_slice(vaultname.as_bytes());
         offset += VAULTNAME_LENGTH;
 
         let mut userkey_iv = [0u8; IV_LENGTH];
-        userkey_iv.copy_from_slice(&header_data[offset..offset+IV_LENGTH]);
+        userkey_iv.copy_from_slice(&header_data[offset..offset + IV_LENGTH]);
         offset += IV_LENGTH;
 
         //Get the keyregion nonce for decrypting the keyregion
         let mut key_nonce = [0u8; AES_NONCE_LENGTH];
-        key_nonce.copy_from_slice(&header_data[offset..offset+AES_NONCE_LENGTH]);
+        key_nonce.copy_from_slice(&header_data[offset..offset + AES_NONCE_LENGTH]);
         offset += AES_NONCE_LENGTH;
 
         let mut encrypted_key = [0u8; VAULTKEY_ENC_LENGTH];
-        encrypted_key.copy_from_slice(&header_data[offset..offset+VAULTKEY_ENC_LENGTH]);
+        encrypted_key.copy_from_slice(&header_data[offset..offset + VAULTKEY_ENC_LENGTH]);
 
         Ok(HeaderInfo {
             version,
-            name: vaultname,
+            name: *vaultname_buf.as_array().unwrap(),
             userkey_iv,
             vaultkey_nonce: key_nonce,
             enc_vaultkey: encrypted_key,
         })
+    }
+
+    pub fn get_name(&self) -> String {
+       String::from_utf8(self.name.to_vec()).unwrap()
     }
 }
 
@@ -141,17 +148,17 @@ impl HeaderInfo {
 pub struct VaultContext {
     vault_file: File,
     empty_blocks: BlockSet,
-    // TODO decide how to handle key retrieval (should context do it or should it be done by the
-    // manager)
-    // (Probably the manager?)
-    // TODO retrieve secret functions in entries to use context
-    pub header: HeaderInfo
 }
 
 impl VaultContext {
-    /// Create a new vaultcontext root is the root directory entry vault_file is the path to the vault file
+    /// Create a new Vaultcontext from a vaultfile
+    /// This function establishes the lock on the vaultfile and also returns the root Directory
+    /// because this function needs to establish a collection of empty blocks for vault changes
+    /// Empty blocks can only be calculated using an a root directory
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
-    pub fn new(vault_file: String, key: &[u8]) -> Result<Self, InitVaultContextError> {
+    pub fn new(
+        vault_file: String,
+    ) -> Result<(Self, DirectoryEntry, HeaderInfo), InitVaultContextError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let mut file = OpenOptions::new()
             .read(true)
@@ -159,23 +166,29 @@ impl VaultContext {
             .append(false)
             .open(&vault_file)
             .map_err(|e| InitVaultContextError::VaultLockError(VaultLockError::FileError(e)))?;
-        let mut header = [0u8; VAULTHEADER_LENGTH];
-        let read_bytes = file.read(&mut header).map_err(|e| InitVaultContextError::ReadHeaderError(ReadHeaderError::FileError(e)))?;
-        if read_bytes < VAULTHEADER_LENGTH {
-            return Err(InitVaultContextError::ReadHeaderError(ReadHeaderError::UnexpectedEOF))
-        }
-        let mut context = VaultContext {
-            vault_file: file,
-            empty_blocks: BlockSet::new(),
-            header: HeaderInfo::build_header(header).map_err(|e| InitVaultContextError::ReadHeaderError(e))?
-        };
-
-        match context.vault_file.try_lock() {
+        match file.try_lock() {
             Ok(()) => {
-                let root = DirectoryEntry::build_entry_rec(0, &mut context, key)
+                let mut header = [0u8; VAULTHEADER_LENGTH];
+                let read_bytes = file.read(&mut header).map_err(|e| {
+                    InitVaultContextError::ReadHeaderError(ReadHeaderError::FileError(e))
+                })?;
+                if read_bytes < VAULTHEADER_LENGTH {
+                    return Err(InitVaultContextError::ReadHeaderError(
+                        ReadHeaderError::UnexpectedEOF,
+                    ));
+                }
+                let mut context = VaultContext {
+                    vault_file: file,
+                    empty_blocks: BlockSet::new(),
+                };
+                let header = HeaderInfo::build_header(header)
+                        .map_err(|e| InitVaultContextError::ReadHeaderError(e))?;
+                let mut key = header.retrieve_key().map_err(|e| InitVaultContextError::RetrieveKeyError(e))?; 
+                let root = DirectoryEntry::build_entry_rec(0, &mut context, &key)
                     .map_err(|e| InitVaultContextError::BuildVaultError(e))?;
                 context.empty_blocks = root.occupied_datablocks().get_empty_space();
-                Ok(context)
+                key.zeroize(); 
+                Ok((context, root, header))
             }
             Err(TryLockError::WouldBlock) => Err(InitVaultContextError::VaultLockError(
                 VaultLockError::VaultBusy,
@@ -369,6 +382,10 @@ impl VaultContext {
         } else {
             Ok(())
         }
+    }
+
+    fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
+        self.header.retrieve_key()
     }
 }
 

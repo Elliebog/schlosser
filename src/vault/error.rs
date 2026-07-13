@@ -1,28 +1,22 @@
 use std::{fs::TryLockError, string::FromUtf8Error};
 
+use memsecurity::MemSecurityErr;
+
 use crate::{crypt::CryptographyError, vault::utils::VaultPath};
 
 
 pub enum RetrieveSecretError {
-    InvalidDataBlockError(i64),
-    InvalidVaultPath(InvalidVaultPathError),
-    VaultError(VaultError),
-    FileError(std::io::Error),
     UTF8Error(FromUtf8Error),
-    DataBlockError(ReadDataBlockError),
-    InvalidOperation(Operation, EntryType),
-    RetrieveKeyError(RetrieveKeyError),
+    VaultFileError(VaultFileError),
+    DecryptError(CryptographyError)
 }
 
-impl From<VaultError> for RetrieveSecretError {
-    fn from(value: VaultError) -> Self {
-        RetrieveSecretError::VaultError(value)
-    } }
-
-impl From<ReadDataBlockError> for RetrieveSecretError {
-    fn from(value: ReadDataBlockError) -> Self {
-        RetrieveSecretError::DataBlockError(value)
-    }
+pub enum RetrieveEntryError {
+    InvalidOperation(Operation, EntryType),
+    SecretError(RetrieveSecretError),
+    InvalidVaultPath(InvalidVaultPathError),
+    GetEntryError(VaultError),
+    RetrieveKeyError(MemSecurityErr)
 }
 
 pub enum Operation {
@@ -37,8 +31,9 @@ pub enum EntryType {
 }
 
 pub enum RenameEntryError {
+    RetrieveKeyError(MemSecurityErr),
     InvalidVaultPath(InvalidVaultPathError),
-    VaultError(VaultError),
+    VaultError(VaultChangeError),
 }
 
 pub enum RenameError {
@@ -48,7 +43,7 @@ pub enum RenameError {
 
 pub enum DeleteEntryError {
     InvalidVaultPath(InvalidVaultPathError),
-    VaultError(VaultError),
+    VaultError(VaultChangeError),
 }
 
 pub enum NewEntryError {
@@ -56,7 +51,7 @@ pub enum NewEntryError {
     NameLengthError(NameLengthExceededError),
     InvalidVaultPath(InvalidVaultPathError),
     VaultChangeError(VaultChangeError),
-    RetrieveKeyError(RetrieveKeyError),
+    RetrieveKeyError(MemSecurityErr),
 }
 
 #[derive(Debug)]
@@ -74,7 +69,7 @@ pub enum VaultChangeEntryError {
     InvalidVaultPath(InvalidVaultPathError),
     VaultError(VaultError),
     InvalidOperation(Operation, EntryType),
-    RetrieveKeyError(RetrieveKeyError),
+    RetrieveKeyError(MemSecurityErr),
 }
 
 impl From<VaultError> for VaultChangeEntryError {
@@ -138,14 +133,7 @@ pub enum RetrieveKeyError {
     DecryptError(CryptographyError),
 }
 
-pub enum EncryptVaultTableError {
-    SerializationError(SerializationError),
-    EncryptVaultError(CryptographyError),
-    RetrieveKeyError(RetrieveKeyError),
-}
-
 pub enum SaveVaultError {
-    EncryptVaultTableError(EncryptVaultTableError),
     FileError(std::io::Error),
 }
 
@@ -185,7 +173,9 @@ pub enum BuildEntryError {
 pub enum InitVaultContextError {
     BuildVaultError(BuildVaultError),
     VaultLockError(VaultLockError),
-    ReadHeaderError(ReadHeaderError)
+    ReadHeaderError(ReadHeaderError),
+    RetrieveKeyError(RetrieveKeyError),
+    EncryptedMemError(MemSecurityErr)
 }
 
 pub enum ReadHeaderError {

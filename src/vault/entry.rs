@@ -9,22 +9,22 @@ use std::{
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypt::{AES_NONCE_LENGTH, EncryptFileError, decrypt_region, encrypt_file, encrypt_region},
+    crypt::{
+        AES_NONCE_LENGTH, EncryptFileError, decrypt_region, decrypt_region_dyn, encrypt_file,
+        encrypt_region,
+    },
     vault::{
         error::{
             BuildEntryError, BuildVaultError, EntryType, FileChangeError, NameLengthExceededError,
-            Operation, ReadVaultFileError, RenameError, RetrieveSecretError, SerializationError,
-            VaultChangeError, VaultError, VaultFileError,
+            Operation, RenameError, RetrieveEntryError, RetrieveSecretError, SerializationError,
+            VaultChangeError, VaultError,
         },
         manager::{
-            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DIRENTRY_TYPE, PASSWORDENTRY_TYPE,
-            SECRET_SIZE_LENGTH, SECRETENTRY_TYPE, VAULTENTRY_LENGTH, VAULTENTRYNAME_LENGTH,
-            VAULTNAME_LENGTH,
+            AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, DATABLOCK_RAW_LENGTH,
+            DIRENTRY_TYPE, PASSWORDENTRY_TYPE, SECRET_SIZE_LENGTH, SECRETENTRY_TYPE,
+            VAULTENTRY_LENGTH, VAULTENTRYNAME_LENGTH, VAULTNAME_LENGTH,
         },
-        utils::{
-            BlockRange, BlockSet, DataBlockEntry, VaultContext, VaultPath, read_data_block,
-            read_dyn_data_block,
-        },
+        utils::{BlockRange, BlockSet, DataBlockEntry, VaultContext, VaultPath},
     },
 };
 // Vault string constants
@@ -52,8 +52,7 @@ pub enum EntryResult {
 pub trait EncryptedEntry<I, O> {
     fn retrieve_secret(
         &self,
-        reader: &mut BufReader<File>,
-        data_start: u64,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<O, RetrieveSecretError>;
 
@@ -126,13 +125,16 @@ pub struct PasswordEntry {
 impl EncryptedEntry<String, String> for PasswordEntry {
     fn retrieve_secret(
         &self,
-        reader: &mut BufReader<File>,
-        data_start: u64,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<String, RetrieveSecretError> {
         // Overflow cannot happen as the cap on u64 is so high it will never be reached
-        let datablock_offset = data_start + self.pwd_block as u64 * DATABLOCK_LENGTH as u64;
-        let data = read_data_block(reader, datablock_offset, key, &self.pwd_block_nonce)?;
+        let enc_datablock = context
+            .read_datablock(self.pwd_block)
+            .map_err(|e| RetrieveSecretError::VaultFileError(e))?;
+        let data: [u8; DATABLOCK_RAW_LENGTH] =
+            decrypt_region(&enc_datablock, &self.pwd_block_nonce, key)
+                .map_err(|e| RetrieveSecretError::DecryptError(e))?;
 
         // Passwords are encrypted by first padding the field with 0's
         // To get the original password we discard anything that is not ascii
@@ -359,18 +361,14 @@ pub struct SecretFileEntry {
 impl EncryptedEntry<String, Bytes> for SecretFileEntry {
     fn retrieve_secret(
         &self,
-        reader: &mut BufReader<File>,
-        data_start: u64,
+        context: &mut VaultContext,
         key: &[u8],
     ) -> Result<Bytes, RetrieveSecretError> {
-        let data_start = data_start + self.start * DATABLOCK_LENGTH as u64;
-        let data = read_dyn_data_block(
-            reader,
-            data_start,
-            key,
-            &self.nonce,
-            self.size as usize * DATABLOCK_LENGTH,
-        )?;
+        let enc_datablock = context
+            .read_dyn_datablock(BlockRange::new(self.start, self.size as usize))
+            .map_err(|e| RetrieveSecretError::VaultFileError(e))?;
+        let data = decrypt_region_dyn(enc_datablock.to_vec(), &self.nonce, key)
+            .map_err(|e| RetrieveSecretError::DecryptError(e))?;
         Ok(Bytes::from(data))
     }
 
@@ -932,7 +930,6 @@ impl DirectoryEntry {
         mut path: VecDeque<&str>,
         total_path: &VaultPath,
         context: &mut VaultContext,
-        key: &[u8],
     ) -> Result<(), VaultChangeError> {
         let name = match path.pop_front() {
             None => Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
@@ -970,7 +967,7 @@ impl DirectoryEntry {
         } else if let VaultEntry::Directory(dir) =
             &mut self.children[self.map.get(name).unwrap().clone()]
         {
-            dir.delete_entry(path, total_path, context, key)
+            dir.delete_entry(path, total_path, context)
         } else {
             Err(VaultChangeError::VaultError(VaultError::EntryNotFound(
                 total_path.clone(),
@@ -1031,25 +1028,21 @@ impl DirectoryEntry {
         let mut curr_block = dir_entry.first_child;
         loop {
             if curr_block < 0 {
-                break Ok(dir_entry)
+                break Ok(dir_entry);
             } else {
                 let datablock = context
                     .read_entry(curr_block as u64)
                     .map_err(|e| BuildVaultError::VaultFileError(e))?;
                 let entry =
                     match datablock.entry_type {
-                        PASSWORDENTRY_TYPE => Ok(VaultEntry::Password(PasswordEntry::build_entry(
-                            datablock,
-                            key,
-                            curr_block as u64,
-                        )
-                        .map_err(|e| BuildVaultError::BuildEntryError(e))?)),
-                        SECRETENTRY_TYPE => Ok(VaultEntry::Secret(SecretFileEntry::build_entry(
-                            datablock,
-                            key,
-                            curr_block as u64,
-                        )
-                        .map_err(|e| BuildVaultError::BuildEntryError(e))?)),
+                        PASSWORDENTRY_TYPE => Ok(VaultEntry::Password(
+                            PasswordEntry::build_entry(datablock, key, curr_block as u64)
+                                .map_err(|e| BuildVaultError::BuildEntryError(e))?,
+                        )),
+                        SECRETENTRY_TYPE => Ok(VaultEntry::Secret(
+                            SecretFileEntry::build_entry(datablock, key, curr_block as u64)
+                                .map_err(|e| BuildVaultError::BuildEntryError(e))?,
+                        )),
                         DIRENTRY_TYPE => Ok(VaultEntry::Directory(
                             DirectoryEntry::build_entry_rec(curr_block as u64, context, key)?,
                         )),
@@ -1092,7 +1085,7 @@ impl VaultEntry {
         match self {
             VaultEntry::Password(pwd) => pwd.get_next(),
             VaultEntry::Secret(sec) => sec.get_next(),
-            VaultEntry::Directory(dir) => dir.get_next()
+            VaultEntry::Directory(dir) => dir.get_next(),
         }
     }
 
@@ -1106,18 +1099,19 @@ impl VaultEntry {
 
     pub fn retrieve_secret(
         &self,
-        reader: &mut BufReader<File>,
-        data_start: u64,
+        context: &mut VaultContext,
         key: &[u8],
-    ) -> Result<EntryResult, RetrieveSecretError> {
+    ) -> Result<EntryResult, RetrieveEntryError> {
         match self {
             VaultEntry::Password(pwd) => Ok(EntryResult::Password(
-                pwd.retrieve_secret(reader, data_start, key)?,
+                pwd.retrieve_secret(context, key)
+                    .map_err(|e| RetrieveEntryError::SecretError(e))?,
             )),
             VaultEntry::Secret(sec) => Ok(EntryResult::Secret(
-                sec.retrieve_secret(reader, data_start, key)?,
+                sec.retrieve_secret(context, key)
+                    .map_err(|e| RetrieveEntryError::SecretError(e))?,
             )),
-            VaultEntry::Directory(_) => Err(RetrieveSecretError::InvalidOperation(
+            VaultEntry::Directory(_) => Err(RetrieveEntryError::InvalidOperation(
                 Operation::RetrieveSecret,
                 EntryType::Directory,
             )),
