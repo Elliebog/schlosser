@@ -1,6 +1,5 @@
 use std::{
-    fs::{File, OpenOptions, TryLockError},
-    io::{Read, Seek, SeekFrom, Write, stdin},
+    fmt::Display, fs::{File, OpenOptions, TryLockError}, io::{Read, Seek, SeekFrom, Write, stdin}
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -9,19 +8,12 @@ use zeroize::Zeroize;
 
 use crate::{
     crypt::{
-        AES_NONCE_LENGTH, IV_LENGTH, KEY_LENGTH, decrypt_region, encrypt_region,
-        generate_user_key, generate_vault_key,
+        AES_NONCE_LENGTH, CryptographyError, IV_LENGTH, KEY_LENGTH, decrypt_region, encrypt_region, generate_user_key, generate_vault_key
     },
     vault::{
-        entry::{DirectoryEntry, Entry},
-        error::{
-            CreateVaultContextError, FileChangeError, InitVaultContextError, InvalidFileReasons,
-            InvalidVaultPathError, ReadHeaderError, RetrieveKeyError, SeekFileError,
-            VaultFileError, VaultLockError,
-        },
-        manager::{
+        entry::{DirectoryEntry, Entry}, error::{RetrieveVaultKeyError, HeaderError, InvalidHeaderData, InvalidHeaderError, InvalidVaultPathError, VaultFileError}, manager::{
             AES_GCM_AUTH_TAG, BLOCKID_LENGTH, DATABLOCK_LENGTH, ENTRYTYPE_LENGTH, NEXT_OFFSET,
-        },
+        }
     },
 };
 
@@ -54,15 +46,13 @@ pub struct HeaderInfo {
 }
 
 impl HeaderInfo {
-    fn init_header() -> Result<(HeaderInfo, [u8; KEY_LENGTH]), RetrieveKeyError> {
-        let mut passwd = String::new();
-        stdin().read_line(&mut passwd).map_err(RetrieveKeyError::StdinError)?;
+    fn init_header(passwd: String) -> Result<(HeaderInfo, [u8; KEY_LENGTH]), CryptographyError> {
         let mut userkey_iv = [0u8; IV_LENGTH];
         OsRng.fill_bytes(&mut userkey_iv);
 
         let key = generate_user_key(passwd, &userkey_iv);
         let raw_vaultkey = generate_vault_key();
-        let vaultkey = encrypt_region(&raw_vaultkey, &key).map_err(RetrieveKeyError::CryptError)?;
+        let vaultkey = encrypt_region(&raw_vaultkey, &key)?;
         Ok((
             HeaderInfo {
                 version: VAULT_VERSION,
@@ -85,21 +75,21 @@ impl HeaderInfo {
 
     /// Get the key encrypted in the header using the supplied password. Uses pbkdf2_hmac to
     /// generate a key which is then used to decrypt the vault master key
-    pub fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveKeyError> {
+    pub fn retrieve_key(&self) -> Result<[u8; KEY_LENGTH], RetrieveVaultKeyError> {
         let mut pwd: String = String::new();
         stdin()
             .read_line(&mut pwd)
-            .map_err(RetrieveKeyError::StdinError)?;
+            .map_err(RetrieveVaultKeyError::ReadPwd)?;
 
         let user_key = generate_user_key(pwd, &self.userkey_iv);
         let vault_key =
             decrypt_region::<KEY_LENGTH>(&self.enc_vaultkey, &self.vaultkey_nonce, &user_key);
-        vault_key.map_err(RetrieveKeyError::CryptError)
+        vault_key.map_err(RetrieveVaultKeyError::Decrypt)
     }
 
     /// Read the vault archive file header.
     /// This expects the Bufreader to be at the start of the file
-    fn build_header(header_data: [u8; VAULTHEADER_LENGTH]) -> Result<Self, ReadHeaderError> {
+    fn build_header(header_data: [u8; VAULTHEADER_LENGTH]) -> Result<Self, HeaderError> {
         let mut offset = 0;
         // Check if this file is meant to be a vault archive file
         let mut signature_buf = [0u8; VAULT_SIGNATURE_LENGTH];
@@ -108,9 +98,7 @@ impl HeaderInfo {
         offset += VAULT_SIGNATURE_LENGTH;
 
         if signature != VAULT_SIGNATURE {
-            return Err(ReadHeaderError::InvalidFileError(
-                InvalidFileReasons::WrongSignature,
-            ));
+            return Err(HeaderError::from(InvalidHeaderData::InvalidSignature));
         }
 
         //Add a version field for future changes to the vault archive structure
@@ -120,9 +108,7 @@ impl HeaderInfo {
         offset += VAULT_VERSION_LENGTH;
 
         if version != VAULT_VERSION {
-            return Err(ReadHeaderError::InvalidFileError(
-                InvalidFileReasons::UnsupportedVersion,
-            ));
+            return Err(HeaderError::InvalidHeaderData(InvalidHeaderData::UnsupportedVersion(version)));
         }
 
         let mut userkey_iv = [0u8; IV_LENGTH];
@@ -190,31 +176,25 @@ impl VaultContext {
     /// Returns a VaultLockError if the file does not exist or the vault lock could not be acquired
     pub fn from_file(
         vault_file: String,
-    ) -> Result<(Self, DirectoryEntry, [u8; KEY_LENGTH]), InitVaultContextError> {
+    ) -> Result<(Self, DirectoryEntry, [u8; KEY_LENGTH]), VaultFileError> {
         // acquire a lock on the vault file. No other instance should be able to access the vault
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(false)
-            .open(&vault_file)
-            .map_err(|e| InitVaultContextError::VaultLockError(VaultLockError::FileError(e)))?;
+            .open(&vault_file)?;
         match file.try_lock() {
             Ok(()) => {
                 let mut header = [0u8; VAULTHEADER_LENGTH];
-                let read_bytes = file.read(&mut header).map_err(|e| {
-                    InitVaultContextError::ReadHeaderError(ReadHeaderError::FileError(e))
-                })?;
+                let read_bytes = file.read(&mut header)?;
                 if read_bytes < VAULTHEADER_LENGTH {
-                    return Err(InitVaultContextError::ReadHeaderError(
-                        ReadHeaderError::UnexpectedEOF,
-                    ));
+                    return Err(VaultFileError::UnexpectedEOF);
                 }
                 let mut context = VaultContext {
                     vault_file: file,
                     empty_blocks: BlockSet::new(),
                 };
-                let header = HeaderInfo::build_header(header)
-                    .map_err(InitVaultContextError::ReadHeaderError)?;
+                let header = HeaderInfo::build_header(header)?;
                 let mut key = header
                     .retrieve_key()
                     .map_err(InitVaultContextError::RetrieveKeyError)?;
@@ -236,15 +216,12 @@ impl VaultContext {
     /// Changes the next value of an entry block.
     /// Returns an error if the block cannot be found or the was a general file error
     /// Assumes that the block is an entry block
-    pub fn change_next(&mut self, block: u64, new_value: i64) -> Result<(), FileChangeError> {
-        self.jump_to_block(block)
-            .map_err(FileChangeError::SeekFileError)?;
+    pub fn change_next(&mut self, block: u64, new_value: i64) -> Result<(), VaultFileError> {
+        self.jump_to_block(block)?;
         self.vault_file
-            .seek(SeekFrom::Current(NEXT_OFFSET as i64))
-            .map_err(FileChangeError::FileError)?;
+            .seek(SeekFrom::Current(NEXT_OFFSET as i64))?;
         self.vault_file
-            .write_all(&new_value.to_be_bytes())
-            .map_err(FileChangeError::FileError)?;
+            .write_all(&new_value.to_be_bytes())?;
         Ok(())
     }
 
@@ -252,21 +229,19 @@ impl VaultContext {
     /// Panics if data length is not a multiple of DATABLOCK_LENGTH
     /// This method assumes you are only changing the data and keeping the blockrange the same.
     /// If shrinking/growing is needed use [`change_dyn_data`]
-    pub fn change_data(&mut self, block: u64, data: Bytes) -> Result<(), FileChangeError> {
-        self.jump_to_block(block)
-            .map_err(FileChangeError::SeekFileError)?;
+    pub fn change_data(&mut self, block: u64, data: Bytes) -> Result<(), VaultFileError> {
+        self.jump_to_block(block)?;
         if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
         self.vault_file
-            .write_all(&data)
-            .map_err(FileChangeError::FileError)?;
+            .write_all(&data)?;
         Ok(())
     }
 
     /// Create a new block with size determined by the amount of bytes in data (has to be a multiple
     /// of DATABLOCK_LENGTH)
-    pub fn new_block(&mut self, data: Bytes) -> Result<BlockRange, FileChangeError> {
+    pub fn new_block(&mut self, data: Bytes) -> Result<BlockRange, VaultFileError> {
         if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
@@ -278,32 +253,27 @@ impl VaultContext {
         let file_end = self
             .vault_file
             .seek(SeekFrom::End(0))
-            .map_err(FileChangeError::FileError)?;
+            .map_err(VaultFileError::File)?;
 
         if offset >= file_end {
             self.vault_file
-                .write(&data)
-                .map_err(FileChangeError::FileError)?;
+                .write(&data)?;
         } else {
             self.vault_file
-                .seek(SeekFrom::Start(offset))
-                .map_err(FileChangeError::FileError)?;
+                .seek(SeekFrom::Start(offset))?;
             self.vault_file
-                .write(&data)
-                .map_err(FileChangeError::FileError)?;
+                .write(&data)?;
         }
         Ok(new_block)
     }
 
     /// Deletes a block, by zeroize-ing its contents and adding it to the internal empty block
     /// Blockset
-    pub fn delete_block(&mut self, block: BlockRange) -> Result<(), FileChangeError> {
-        self.jump_to_block(block.start)
-            .map_err(FileChangeError::SeekFileError)?;
+    pub fn delete_block(&mut self, block: BlockRange) -> Result<(), VaultFileError> {
+        self.jump_to_block(block.start)?;
         let new_data = BytesMut::zeroed(block.len() * DATABLOCK_LENGTH);
         self.vault_file
-            .write(&new_data.freeze())
-            .map_err(FileChangeError::FileError)?;
+            .write(&new_data.freeze())?;
         self.empty_blocks.put(block);
         Ok(())
     }
@@ -315,7 +285,7 @@ impl VaultContext {
         &mut self,
         old_block: BlockRange,
         data: Bytes,
-    ) -> Result<Option<BlockRange>, FileChangeError> {
+    ) -> Result<Option<BlockRange>, VaultFileError> {
         if !data.len().is_multiple_of(DATABLOCK_LENGTH) {
             panic!("Provided data length is not a multiple of DATABLOCK_LENGTH")
         }
@@ -339,13 +309,11 @@ impl VaultContext {
     /// Read a raw datablock from the vault file
     /// returns an error on io failures or unexpected EOF or Invalid datablock ids
     pub fn read_datablock(&mut self, block: u64) -> Result<[u8; DATABLOCK_LENGTH], VaultFileError> {
-        self.jump_to_block(block)
-            .map_err(VaultFileError::SeekFileError)?;
+        self.jump_to_block(block)?;
         let mut buf = [0u8; DATABLOCK_LENGTH];
         let bytes_read = self
             .vault_file
-            .read(&mut buf)
-            .map_err(VaultFileError::FileError)?;
+            .read(&mut buf)?;
         if bytes_read < DATABLOCK_LENGTH {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -356,13 +324,11 @@ impl VaultContext {
     /// Read a multi-datablock structure from the vault file
     /// returns an error on io failures, unexpected EOF or invalid datablock ids
     pub fn read_dyn_datablock(&mut self, block: BlockRange) -> Result<Bytes, VaultFileError> {
-        self.jump_to_block(block.start)
-            .map_err(VaultFileError::SeekFileError)?;
+        self.jump_to_block(block.start)?;
         let mut bytes = BytesMut::zeroed(DATABLOCK_LENGTH * block.len());
         let bytes_read = self
             .vault_file
-            .read(&mut bytes)
-            .map_err(VaultFileError::FileError)?;
+            .read(&mut bytes)?;
         if bytes_read < DATABLOCK_LENGTH * block.len() {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -373,13 +339,11 @@ impl VaultContext {
     /// Reads a datablock containing an entry and decomposes it into its common structure
     /// returns an error on io failures, unexpected EOF or invalid datablock ids
     pub fn read_entry(&mut self, block: u64) -> Result<DataBlockEntry, VaultFileError> {
-        self.jump_to_block(block)
-            .map_err(VaultFileError::SeekFileError)?;
+        self.jump_to_block(block)?;
         let mut buf = [0u8; DATABLOCK_LENGTH];
         let bytes_read = self
             .vault_file
-            .read(&mut buf)
-            .map_err(VaultFileError::FileError)?;
+            .read(&mut buf)?;
         if bytes_read < DATABLOCK_LENGTH {
             Err(VaultFileError::UnexpectedEOF)
         } else {
@@ -412,14 +376,13 @@ impl VaultContext {
     }
 
     /// Internal function that seeks to a certain block offset
-    fn jump_to_block(&mut self, block: u64) -> Result<(), SeekFileError> {
+    fn jump_to_block(&mut self, block: u64) -> Result<(), VaultFileError> {
         let block_offset = VAULTHEADER_LENGTH as u64 + block * DATABLOCK_LENGTH as u64;
         let file_len = self
             .vault_file
-            .seek(SeekFrom::End(0))
-            .map_err(SeekFileError::FileError)?;
+            .seek(SeekFrom::End(0))?;
         if file_len < block_offset {
-            Err(SeekFileError::BlockNotFound(block))
+            Err(VaultFileError::InvalidBlockPosition(block))
         } else {
             Ok(())
         }
@@ -440,6 +403,12 @@ pub struct DataBlockEntry {
 #[derive(Debug, Clone)]
 pub struct VaultPath {
     path: String,
+}
+
+impl Display for VaultPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.path)
+    }
 }
 
 impl VaultPath {

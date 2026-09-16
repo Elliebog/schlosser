@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Write,
-    fs::File,
-    io::BufReader,
     vec::IntoIter,
 };
 
@@ -1118,11 +1116,11 @@ impl VaultEntry {
         match self {
             VaultEntry::Password(pwd) => Ok(EntryResult::Password(
                 pwd.retrieve_secret(context, key)
-                    .map_err(|e| RetrieveEntryError::SecretError(e))?,
+                    .map_err(|e| RetrieveEntryError::Secret(e))?,
             )),
             VaultEntry::Secret(sec) => Ok(EntryResult::Secret(
                 sec.retrieve_secret(context, key)
-                    .map_err(|e| RetrieveEntryError::SecretError(e))?,
+                    .map_err(|e| RetrieveEntryError::Secret(e))?,
             )),
             VaultEntry::Directory(_) => Err(RetrieveEntryError::InvalidOperation(
                 Operation::RetrieveSecret,

@@ -1,5 +1,5 @@
 use std::{fs::File, io::Read};
-
+use thiserror::Error;
 use crate::vault::{manager::{AES_GCM_AUTH_TAG, DATABLOCK_LENGTH}, utils::VAULTKEY_ENC_LENGTH};
 use aes_gcm::{
     Aes256Gcm, Key, KeyInit, Nonce, aead::{Aead, Generate}
@@ -14,6 +14,8 @@ const PBKDF2_ITERATIONS: usize = 300000;
 pub const KEY_LENGTH: usize = 32;
 pub const AES_NONCE_LENGTH: usize = 12;
 
+#[derive(Error,Debug)]
+#[error("Cryptographic operation failed. Reason: {message}")]
 pub struct CryptographyError {
     pub message: String
 }

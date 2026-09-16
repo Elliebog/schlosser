@@ -88,7 +88,7 @@ impl VaultManager {
         let target_entry = self
             .root
             .get_entry(path.parts().into(), &path)
-            .map_err(RetrieveEntryError::GetEntryError)?;
+            .map_err(RetrieveEntryError::GetEntry)?;
         // The keys dont need to be zeroized after this operation as it is done automatically due to
         // it being ZeroizeBytes
         let temp_key = self
